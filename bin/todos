@@ -64,7 +64,7 @@ search() {
     rg "$@" -w -e "$pattern" -- "${paths[@]}"
   elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if [ "$mode" = count ]; then
-      set -- --only-matching -h --color=never
+      set -- --only-matching -h --no-line-number --no-column --color=never
     else
       set -- --line-number --color="$color"
     fi
@@ -82,16 +82,19 @@ search() {
   fi
 }
 
-# All three tools exit 1 when nothing matches, 2 or more on a real error.
+# All three tools exit 1 when nothing matches, and 2 on an error such as an
+# unreadable folder, in which case they still print what they did find.
 status=0
 if [ "$count" -eq 1 ]; then
   results=$(search count) || status=$?
-  [ "$status" -le 1 ] || exit "$status"
   if [ -n "$results" ]; then
     printf '%s\n' "$results" | sort | uniq -c | sort -rn
   fi
 else
   search list || status=$?
-  [ "$status" -le 1 ] || exit "$status"
 fi
-[ "$status" -eq 0 ] || echo "No ${tags//,/, } markers found." >&2
+if [ "$status" -eq 1 ]; then
+  echo "No ${tags//,/, } markers found." >&2
+  exit 0
+fi
+exit "$status"

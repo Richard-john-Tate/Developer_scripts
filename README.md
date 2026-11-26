@@ -42,10 +42,10 @@ you can type `git sync` instead of `git-sync`.
 
 | Command | What it does |
 | --- | --- |
-| [`extract`](bin/extract) | Unpack any common archive: tar.gz, zip, xz, zst, 7z, rar and more. |
+| [`extract`](bin/extract) | Unpack any common archive: tar.gz, zip, xz, zst, 7z, rar and more. Never overwrites existing files unless you pass `--force`. |
 | [`backup`](bin/backup) | Make a timestamped copy of a file, or a `.tar.gz` of a folder, before you change it. |
 | [`bigfiles`](bin/bigfiles) | The largest files in a folder. `-g` finds the largest files ever committed to a repo's history. |
-| [`clean-artifacts`](bin/clean-artifacts) | Find `node_modules`, `__pycache__`, `target` and similar folders, show their size, and delete them. Never deletes anything git tracks. |
+| [`clean-artifacts`](bin/clean-artifacts) | Find `node_modules`, `__pycache__`, `target` and similar folders, show their size, and delete them. Never deletes a folder that git tracks files in or that holds a repository. |
 
 ### Code and projects
 

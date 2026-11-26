@@ -5,6 +5,7 @@
 # Because it is named git-*, git runs it as a subcommand:  git standup
 #
 set -euo pipefail
+unset CDPATH
 
 readonly PROG=${0##*/}
 
@@ -61,22 +62,27 @@ case $days in
   ''|*[!0-9]*) usage_error "--days must be a whole number, got '$days'" ;;
 esac
 
-if [ "$everyone" -eq 0 ] && [ -z "$author" ]; then
-  author=$(git config user.email 2>/dev/null || git config user.name 2>/dev/null || true)
-  [ -n "$author" ] || die "no git user.email/user.name set; pass --author or --everyone"
-fi
+# Who "you" are can differ per repo (includeIf in ~/.gitconfig), so look it
+# up inside each repository unless --author was given.
+my_identity() { git config user.email 2>/dev/null || git config user.name 2>/dev/null || true; }
 
 color=never
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then color=always; fi
 
 # Print the log for one repository (the current directory).
 standup() {
-  set -- log --all --no-merges --color="$color" \
+  local who=$author
+  if [ "$everyone" -eq 0 ] && [ -z "$who" ]; then
+    who=$(my_identity)
+    [ -n "$who" ] || die "no git user.email or user.name set; pass --author or --everyone"
+  fi
+  # Branches, remotes and tags, but not refs/stash ("WIP on main" isn't work).
+  set -- log --branches --remotes --tags --no-merges --color="$color" \
     --since="$days days ago midnight" \
     --format='%C(yellow)%h%C(reset) %s %C(green)(%cr)%C(reset)%C(dim) <%an>%C(reset)'
   if [ "$everyone" -eq 0 ]; then
     # --fixed-strings: an email like a.b+c@x.com is not meant as a regex.
-    set -- "$@" --fixed-strings --author="$author"
+    set -- "$@" --fixed-strings --author="$who"
   fi
   git --no-pager "$@"
 }
@@ -109,7 +115,7 @@ while IFS= read -r gitpath; do
   fi
   printf '%s\n\n' "$out"
 done <<EOF
-$(find "$root" -maxdepth 4 -name .git -prune -print 2>/dev/null | sort)
+$({ find -H "$root" -maxdepth 4 -name .git -prune -print 2>/dev/null || true; } | sort)
 EOF
 
 [ "$found" -eq 1 ] || echo "No commits $since_label in any repository under $root."

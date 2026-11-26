@@ -36,21 +36,22 @@ for arg in "$@"; do
   esac
 done
 
-# Print "port<TAB>pid" for every listening TCP socket.
+# Print "port<TAB>pid" for every listening TCP socket. The tools exit 1
+# when they find nothing, which isn't an error here.
 listeners() {
   if have lsof; then
     # -F output is stable: "p<pid>" lines, then "n<addr>:<port>" lines.
-    lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null |
+    { lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null || true; } |
       awk '/^p/ { pid = substr($0, 2) }
            /^n/ { n = split($0, a, ":"); print a[n] "\t" pid }'
   elif have ss; then
-    ss -Htlnp 2>/dev/null |
+    { ss -Htlnp 2>/dev/null || true; } |
       awk '{ n = split($4, a, ":"); port = a[n]
              if (match($0, /pid=[0-9]+/)) print port "\t" substr($0, RSTART + 4, RLENGTH - 4)
              else print port "\t-" }'
   elif have netstat; then
     # Linux net-tools: "tcp 0 0 0.0.0.0:22 0.0.0.0:* LISTEN 812/sshd"
-    netstat -tlnp 2>/dev/null |
+    { netstat -tlnp 2>/dev/null || true; } |
       awk '$6 == "LISTEN" { n = split($4, a, ":"); split($7, p, "/")
                             print a[n] "\t" (p[1] ~ /^[0-9]+$/ ? p[1] : "-") }'
   else

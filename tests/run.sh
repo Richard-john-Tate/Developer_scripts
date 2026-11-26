@@ -151,6 +151,38 @@ test_git_clean_branches_outside_repo() {
   expect_out "not inside a git work tree"
 }
 
+test_git_clean_branches_works_from_a_feature_branch() {
+  make_repo
+  git branch in-progress   # started before "finished" was merged
+  git checkout -q -b finished; commit d "finished work"
+  git checkout -q main; git merge -q --no-ff --no-edit finished
+  git checkout -q in-progress; commit w "wip"
+  # Not on main: "git branch -d" alone would refuse to delete "finished".
+  run git clean-branches -y
+  expect_status 0
+  ! git show-ref --quiet refs/heads/finished || fail "merged branch not deleted from a feature branch"
+}
+
+test_git_clean_branches_gone_ignores_local_upstreams() {
+  make_repo
+  git checkout -q -b part1; commit p1 "part 1"
+  git checkout -q -b part2 --track part1; commit p2 "part 2"
+  git checkout -q main; git merge -q --no-ff --no-edit part1
+  run git clean-branches -y
+  expect_status 0
+  run git clean-branches -g -y
+  git show-ref --quiet refs/heads/part2 || fail "stacked branch on a deleted local branch was deleted"
+}
+
+test_git_clean_branches_branch_named_like_a_tag() {
+  make_repo
+  git branch release-1.0; git tag release-1.0
+  run git clean-branches -bmain -y
+  expect_status 0
+  ! git show-ref --quiet refs/heads/release-1.0 || fail "branch shadowed by a tag not deleted"
+  git show-ref --quiet refs/tags/release-1.0 || fail "the tag was deleted"
+}
+
 # --- git-standup ------------------------------------------------------------
 
 test_git_standup_shows_my_recent_commits() {
@@ -170,6 +202,15 @@ test_git_standup_shows_my_recent_commits() {
 
   run git standup -d 1 -A
   expect_out "their work"
+}
+
+test_git_standup_ignores_stash() {
+  make_repo
+  echo change >>README
+  git stash -q
+  run git standup -d 1
+  expect_no_out "WIP on"
+  expect_no_out "index on"
 }
 
 test_git_standup_recursive() {
@@ -237,6 +278,15 @@ test_ports_reports_nothing_listening() {
   run ports "$(free_port)"
   expect_status 1
   expect_out "Nothing you can see is listening"
+}
+
+test_ports_when_lsof_finds_nothing() {
+  # lsof exits 1 when nothing matches; that must not kill the script.
+  mkdir fakebin
+  printf '#!/bin/sh\nexit 1\n' >fakebin/lsof; chmod +x fakebin/lsof
+  run env PATH="$PWD/fakebin:$PATH" ports
+  expect_status 1
+  expect_out "No listening TCP ports found"
 }
 
 test_killport_kills_a_listener() {
@@ -365,6 +415,30 @@ test_extract_tarballs_and_single_files() {
   expect_out "already exists"
 }
 
+test_extract_never_overwrites_without_force() {
+  mkdir -p pkg && echo new >pkg/config.yml && echo other >pkg/extra.txt
+  tar -czf pkg.tar.gz pkg
+  rm -rf pkg
+  mkdir pkg && echo mine >pkg/config.yml
+  run extract pkg.tar.gz
+  expect_status 1
+  expect_out "already exist"
+  [ "$(cat pkg/config.yml)" = mine ] || fail "an existing file was overwritten"
+  expect_no_file pkg/extra.txt
+  [ -z "$(find . -maxdepth 1 -name '.extract.*')" ] || fail "temporary folder left behind"
+
+  run extract --force pkg.tar.gz
+  expect_status 0
+  [ "$(cat pkg/config.yml)" = new ] || fail "--force didn't overwrite"
+}
+
+test_extract_name_starting_with_dash() {
+  mkdir d && echo x >d/f && tar -cf ./-odd.tar d && rm -rf d
+  run extract -d out -- -odd.tar
+  expect_status 0
+  expect_file out/d/f
+}
+
 test_extract_zip_and_list() {
   { have zip && have unzip; } || skip "zip/unzip not installed"
   mkdir src && echo z >src/z.txt
@@ -412,6 +486,34 @@ test_backup_dest_and_copy() {
   [ -f "$1/main.c" ] || fail "directory copy not made in --dest"
 }
 
+test_backup_symlinked_directory_has_real_contents() {
+  mkdir -p releases/v42 && echo app >releases/v42/app.js
+  ln -s releases/v42 current
+  run backup current
+  expect_status 0
+  set -- current.*.tar.gz
+  tar -tzf "$1" | grep -q 'v42/app.js' || fail "backup of a symlinked dir has no files in it"
+  run backup -c current
+  set -- current.*.bak
+  [ -f "$1/app.js" ] && [ ! -L "$1" ] || fail "--copy of a symlinked dir isn't a real copy"
+}
+
+test_backup_refuses_dest_inside_source() {
+  mkdir proj && echo code >proj/main.c
+  run backup -c -d proj/backups proj
+  expect_status 1
+  expect_out "inside"
+  expect_no_file proj/backups/proj
+}
+
+test_backup_name_starting_with_dash() {
+  echo x >-notes.txt
+  run backup -- -notes.txt
+  expect_status 0
+  set -- ./-notes.txt.*.bak
+  [ -f "$1" ] || fail "no backup made"
+}
+
 # --- bigfiles ---------------------------------------------------------------
 
 test_bigfiles_orders_by_size_and_skips_node_modules() {
@@ -428,6 +530,15 @@ test_bigfiles_orders_by_size_and_skips_node_modules() {
 
   run bigfiles -a d
   expect_out huge.bin
+}
+
+test_bigfiles_dir_named_like_a_skipped_folder() {
+  mkdir venv && head -c 5000 /dev/zero >venv/lib.bin
+  ln -s venv linked
+  run bigfiles venv
+  expect_out lib.bin
+  run bigfiles linked
+  expect_out lib.bin
 }
 
 test_bigfiles_git_history() {
@@ -456,6 +567,18 @@ test_todos_finds_and_counts_markers() {
   expect_status 0
   printf '%s\n' "$out" | grep -Eq '^ *2 TODO$' || fail "TODO count should be 2"
   printf '%s\n' "$out" | grep -Eq '^ *1 HACK$' || fail "HACK count should be 1"
+}
+
+test_todos_count_with_git_grep_config() {
+  make_repo
+  printf '%s\n' '# TODO one' '# FIXME two' >app.py
+  git add app.py
+  git config grep.lineNumber true
+  mkdir ../fakebin
+  for tool in bash sed sort uniq grep cat git dirname; do ln -s "$(command -v "$tool")" ../fakebin/; done
+  run env PATH="$PWD/../fakebin" bash "$ROOT/bin/todos" -c
+  expect_status 0
+  printf '%s\n' "$out" | grep -Eq '^ *1 TODO$' || fail "git grep count output has line numbers"
 }
 
 test_todos_without_ripgrep_or_git() {
@@ -565,6 +688,39 @@ test_clean_artifacts_respects_safety_rules() {
   expect_file build/keep.sh
 }
 
+test_clean_artifacts_protects_repos_and_start_dir() {
+  # Not a git repo itself, but holds projects that are.
+  mkdir -p code/out/src code/app/node_modules/x code/build
+  (cd code/out && git init -q && echo x >src/a.c && git add . && git commit -q -m x)
+  echo junk >code/build/junk.o
+  run clean-artifacts -a -n code
+  expect_out "skipping code/out (contains a git repository)"
+  expect_out code/app/node_modules
+  expect_out code/build
+  run clean-artifacts -a -y code
+  expect_file code/out/.git
+  expect_no_file code/build
+  # The folder you point it at is never itself deleted.
+  mkdir -p proj/build && echo x >proj/build/o
+  run clean-artifacts -a -y proj/build
+  expect_file proj/build/o
+}
+
+test_clean_artifacts_gradle_only_in_projects() {
+  mkdir -p home/.gradle proj/.gradle
+  echo "signing.password=secret" >home/.gradle/gradle.properties
+  touch proj/build.gradle
+  run clean-artifacts -n .
+  expect_out proj/.gradle
+  expect_no_out home/.gradle
+}
+
+test_clean_artifacts_symlinked_dir() {
+  mkdir -p real/node_modules/x && ln -s real link
+  run clean-artifacts -n link
+  expect_out link/node_modules
+}
+
 test_clean_artifacts_needs_yes_without_tty() {
   mkdir -p node_modules
   run clean-artifacts . </dev/null
@@ -592,6 +748,13 @@ test_retry_gives_up_with_last_status() {
   run retry -n 3 -d 0 sh -c 'exit 7'
   expect_status 7
   expect_out "giving up after 3"
+}
+
+test_retry_leading_zero_values() {
+  # Bash arithmetic reads 08 as a (bad) octal number unless told otherwise.
+  run retry -n 2 -d 0 -b 08 -m 09 false
+  expect_status 1
+  expect_out "giving up"
 }
 
 test_retry_needs_a_command() {
@@ -660,6 +823,17 @@ test_onchange_ext_filter() {
   [ "$runs" -eq 2 ] || fail "expected 2 runs (start + app.py), got $runs"
 }
 
+test_onchange_watch_dir_named_dist() {
+  mkdir dist && echo 1 >dist/app.js
+  onchange -i 0.2 -p dist -- sh -c 'echo ran >>runs.log' >/dev/null 2>&1 &
+  pid=$!
+  sleep 1
+  echo 2 >dist/app.js
+  sleep 1.2
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  [ "$(wc -l <runs.log | tr -d ' ')" -eq 2 ] || fail "changes in a watched folder named dist were missed"
+}
+
 test_onchange_restart_mode() {
   mkdir w && echo 1 >w/file.txt
   # Each run writes its PID and then sleeps like a server would.
@@ -700,6 +874,27 @@ test_mkscript_creates_working_script() {
   expect_out "already exists"
 }
 
+test_mkscript_description_is_not_code() {
+  # shellcheck disable=SC2016  # the $ and backticks are meant literally
+  run mkscript -E price 'Charge $5 per `whoami` seat'
+  expect_status 0
+  run ./price --help
+  expect_status 0
+  # shellcheck disable=SC2016
+  expect_out 'Charge $5 per `whoami` seat'
+}
+
+test_mkscript_replaces_symlinks_instead_of_writing_through() {
+  echo original >target.sh
+  ln -s target.sh link.sh
+  run mkscript -E link.sh
+  expect_status 1
+  run mkscript -E -f link.sh
+  expect_status 0
+  [ "$(cat target.sh)" = original ] || fail "wrote through the symlink"
+  [ ! -L link.sh ] || fail "symlink not replaced"
+}
+
 # --- install.sh -------------------------------------------------------------
 
 test_install_and_uninstall() {
@@ -719,6 +914,16 @@ test_install_and_uninstall() {
   expect_status 0
   expect_no_file prefix/bin/killport
   [ "$(cat prefix/bin/extract)" = mine ] || fail "uninstall removed a file it didn't install"
+}
+
+test_install_refuses_its_own_bin() {
+  ln -s "$ROOT/bin" linked-bin
+  run "$ROOT/install.sh" --uninstall --prefix "$PWD/linked-bin"
+  expect_status 1
+  expect_file "$ROOT/bin/killport"
+  run "$ROOT/install.sh" --force --prefix "$ROOT/bin"
+  expect_status 1
+  [ ! -L "$ROOT/bin/killport" ] || fail "replaced a script with a link to itself"
 }
 
 # --- runner -----------------------------------------------------------------

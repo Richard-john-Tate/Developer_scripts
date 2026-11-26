@@ -3,6 +3,7 @@
 # install.sh: put the scripts in bin/ on your PATH.
 #
 set -euo pipefail
+unset CDPATH   # so "cd dir" never jumps somewhere else
 
 readonly PROG=${0##*/}
 
@@ -43,13 +44,20 @@ done
 
 src=$(cd "$(dirname "$0")/bin" && pwd)
 
+# If the target is this checkout's own bin/ (directly or through a symlink),
+# "uninstalling" or --force would delete or clobber the scripts themselves.
+if [ -d "$target" ] && [ "$target" -ef "$src" ]; then
+  die "$target is this checkout's bin/ folder; nothing to install or remove there"
+fi
+
 if [ "$uninstall" -eq 1 ]; then
+  [ -d "$target" ] || { echo "Nothing installed in $target."; exit 0; }
   removed=0
   for script in "$src"/*; do
     dest=$target/$(basename "$script")
     # Only remove links that point here, or copies identical to ours.
     if { [ -L "$dest" ] && [ "$(readlink "$dest")" = "$script" ]; } ||
-       { [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$dest" "$script"; }; then
+       { [ -f "$dest" ] && [ ! -L "$dest" ] && ! [ "$dest" -ef "$script" ] && cmp -s "$dest" "$script"; }; then
       rm -f "$dest"
       echo "removed $dest"
       removed=$((removed + 1))
@@ -60,6 +68,7 @@ if [ "$uninstall" -eq 1 ]; then
 fi
 
 mkdir -p "$target"
+target=$(cd "$target" && pwd)   # absolute, for the PATH hint below
 installed=0 skipped=0
 for script in "$src"/*; do
   [ -f "$script" ] && [ -x "$script" ] || continue

@@ -53,6 +53,8 @@ while [ $# -gt 0 ]; do
     -n|--dry-run) dry_run=1 ;;
     -y|--yes)     yes=1 ;;
     -h|--help)    usage; exit 0 ;;
+    -b?*)         base=${1#-b} ;;     # -bmain
+    -r?*)         remote=${1#-r} ;;
     -[!-]?*)      # split bundled short flags: -fg -> -f -g
                   rest=${1#-?}; flag=${1%"$rest"}; shift
                   set -- "$flag" "-$rest" "$@"; continue ;;
@@ -98,24 +100,30 @@ is_protected() {
   return 1
 }
 
-# Collect candidates as "branch<TAB>reason" lines; merged first so a branch
-# that is both merged and gone is deleted with the safe "git branch -d".
+# Collect candidates as "branch<TAB>commit<TAB>reason" lines, merged ones
+# first so a branch that is both counts as merged. lstrip=2 gives the plain
+# branch name even when a tag has the same name (refname:short would not).
+# A branch is only "gone" if it tracked a branch on $remote that no longer
+# exists; a branch stacked on a deleted *local* branch is left alone.
 candidates=$(
   {
-    git for-each-ref --merged "$base_ref" --format='%(refname:short)%09merged' refs/heads/
+    git for-each-ref --merged "$base_ref" \
+      --format='%(refname:lstrip=2)%09%(objectname)%09merged' refs/heads/
     if [ "$gone" -eq 1 ]; then
-      git for-each-ref --format='%(refname:short)%09%(upstream:track)' refs/heads/ |
-        awk -F'\t' '$2 == "[gone]" { print $1 "\tgone" }'
+      git for-each-ref \
+        --format='%(refname:lstrip=2)%09%(objectname)%09%(upstream)%09%(upstream:track)' refs/heads/ |
+        awk -F'\t' -v prefix="refs/remotes/$remote/" \
+          'index($3, prefix) == 1 && $4 == "[gone]" { print $1 "\t" $2 "\tgone" }'
     fi
   } | awk -F'\t' '!seen[$1]++'
 )
 
 to_delete=''
 count=0
-while IFS=$'\t' read -r branch reason; do
+while IFS=$'\t' read -r branch sha reason; do
   [ -n "$branch" ] || continue
   is_protected "$branch" && continue
-  to_delete="$to_delete$branch"$'\t'"$reason"$'\n'
+  to_delete="$to_delete$branch"$'\t'"$sha"$'\t'"$reason"$'\n'
   count=$((count + 1))
 done <<EOF
 $candidates
@@ -127,7 +135,7 @@ if [ "$count" -eq 0 ]; then
 fi
 
 echo "${bold}Branches to delete${reset} (base: $base_ref):"
-printf '%s' "$to_delete" | while IFS=$'\t' read -r branch reason; do
+printf '%s' "$to_delete" | while IFS=$'\t' read -r branch _ reason; do
   if [ "$reason" = gone ]; then
     printf '  %s  %s(upstream gone; not merged into %s)%s\n' "$branch" "$yellow" "$base_ref" "$reset"
   else
@@ -150,16 +158,20 @@ if [ "$yes" -eq 0 ]; then
   esac
 fi
 
+# Delete with -D: "git branch -d" checks against HEAD or the branch's
+# upstream, not $base_ref, so it refuses merged branches whenever you aren't
+# on the base branch. Merging was already checked above; to be safe, skip a
+# branch if it gained commits since it was listed. The "was <sha>" line git
+# prints lets you restore a branch with: git branch <name> <sha>
 status=0
-while IFS=$'\t' read -r branch reason; do
+while IFS=$'\t' read -r branch sha reason; do
   [ -n "$branch" ] || continue
-  if [ "$reason" = gone ]; then
-    # Not merged as far as git can tell, so it needs -D. The "was <sha>" line
-    # git prints lets you restore it with: git branch <name> <sha>
-    git branch -D "$branch" || status=1
-  else
-    git branch -d "$branch" || status=1
+  if [ "$(git rev-parse --verify --quiet "refs/heads/$branch")" != "$sha" ]; then
+    echo "skipped $branch: it changed since it was listed" >&2
+    status=1
+    continue
   fi
+  git branch -D "$branch" || status=1
 done <<EOF
 $to_delete
 EOF

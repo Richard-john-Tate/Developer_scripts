@@ -3,6 +3,7 @@
 # backup: make a quick timestamped copy of files or directories.
 #
 set -euo pipefail
+unset CDPATH   # so "cd dir" never jumps somewhere else
 
 readonly PROG=${0##*/}
 
@@ -62,27 +63,37 @@ unique() {
 
 for path in "${paths[@]}"; do
   [ -e "$path" ] || die "no such file or directory: $path"
+  case $path in -*) path=./$path ;; esac   # so cd and dirname don't see an option
 
-  # Work out the real name and parent, so "." and "dir/" back up properly.
+  # Name the backup after the path as given (so "." and "dir/" work, and a
+  # symlink keeps its own name), but copy the files it really points to.
   if [ -d "$path" ]; then
     abs=$(cd "$path" && pwd)
+    real=$(cd -P "$path" && pwd -P)
   else
     abs=$(cd "$(dirname "$path")" && pwd)/$(basename "$path")
+    real=$abs
   fi
-  [ "$abs" != / ] || die "refusing to back up /"
+  [ "$abs" != / ] && [ "$real" != / ] || die "refusing to back up /"
   name=$(basename "$abs")
-  parent=$(dirname "$abs")
-  out_dir=${dest:-$parent}
+  out_dir=${dest:-$(dirname "$abs")}
 
-  if [ -d "$abs" ] && [ "$copy" -eq 0 ]; then
-    out=$(unique "$out_dir/$name.$stamp" .tar.gz)
-    tar -czf "$out" -C "$parent" "$name"
-  elif [ -d "$abs" ]; then
-    out=$(unique "$out_dir/$name.$stamp" .bak)
-    cp -Rp "$abs" "$out"
+  if [ -d "$real" ]; then
+    # A backup inside the folder it backs up would copy itself (or, with
+    # tar, every earlier backup too).
+    case $(cd -P "$out_dir" && pwd -P)/ in
+      "$real"/*) die "can't put the backup of $path inside $path; use --dest somewhere else" ;;
+    esac
+    if [ "$copy" -eq 0 ]; then
+      out=$(unique "$out_dir/$name.$stamp" .tar.gz)
+      tar -czf "$out" -C "$(dirname "$real")" "$(basename "$real")"
+    else
+      out=$(unique "$out_dir/$name.$stamp" .bak)
+      cp -Rp "$real" "$out"
+    fi
   else
     out=$(unique "$out_dir/$name.$stamp" .bak)
-    cp -p "$abs" "$out"
+    cp -p "$abs" "$out"   # cp follows a symlinked file, copying its contents
   fi
   echo "$path -> $out"
 done

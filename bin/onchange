@@ -13,7 +13,8 @@ Usage: $PROG [options] [--] COMMAND [ARGS...]
 Run COMMAND, then run it again whenever a file under the watched folder
 is added, removed or saved. Handy for tests, linters and builds while you
 edit. It polls for changes, so it needs no extra tools and works the same
-everywhere.
+everywhere. Changes made while the command is running are ignored, so a
+command that writes files (build output, caches) doesn't re-trigger itself.
 
 .git, node_modules and other dependency and cache folders are ignored.
 
@@ -57,7 +58,10 @@ done
 case $interval in ''|*[!0-9.]*) usage_error "--interval must be a number of seconds" ;; esac
 
 # find arguments: skip noisy folders, optionally keep only some extensions.
-find_args=("$watch_dir" \( -name .git -o -name node_modules -o -name __pycache__
+# -H follows the folder if it's a symlink; -mindepth 1 lets you watch a
+# folder that is itself called dist or build.
+case $watch_dir in -*) watch_dir=./$watch_dir ;; esac
+find_args=(-H "$watch_dir" -mindepth 1 \( -name .git -o -name node_modules -o -name __pycache__
   -o -name .venv -o -name venv -o -name .pytest_cache -o -name .mypy_cache
   -o -name .tox -o -name .next -o -name dist -o -name build -o -name target \)
   -prune -o -type f)
@@ -71,10 +75,15 @@ if [ -n "$exts" ]; then
   find_args+=(\))
 fi
 
+# List each file's modification time, size and name. find exits non-zero
+# when a file vanishes mid-scan (editors do this all the time) or a folder
+# can't be read; neither should stop the watch.
 if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
-  stat_files() { find "${find_args[@]}" -printf '%T@ %s %p\n' 2>/dev/null; }    # GNU
+  stat_files() { find "${find_args[@]}" -printf '%T@ %s %p\n' 2>/dev/null || true; }                # GNU find
+elif stat -c %s / >/dev/null 2>&1; then
+  stat_files() { find "${find_args[@]}" -exec stat -c '%Y %s %n' {} + 2>/dev/null || true; }         # GNU stat
 else
-  stat_files() { find "${find_args[@]}" -exec stat -f '%m %z %N' {} + 2>/dev/null; }  # BSD/macOS
+  stat_files() { find "${find_args[@]}" -exec stat -f '%m %z %N' {} + 2>/dev/null || true; }         # BSD stat
 fi
 # One short value that changes whenever any file's time, size or name does.
 fingerprint() { stat_files | LC_ALL=C sort | cksum; }
@@ -106,7 +115,9 @@ run() {
   if [ "$restart" -eq 1 ]; then
     stop_child
     set -m
-    "$@" &
+    # stdin from /dev/null: a background job that reads the terminal (or puts
+    # it in raw mode, like some dev servers) would otherwise be stopped.
+    "$@" </dev/null &
     child=$!
     set +m
   else
@@ -122,6 +133,8 @@ run() {
 
 trap 'stop_child; exit 130' INT
 trap 'stop_child; exit 143' TERM
+trap 'stop_child; exit 129' HUP
+trap 'stop_child' EXIT
 
 echo "Watching $watch_dir${exts:+ (*.${exts//,/, *.})}. Press Ctrl-C to stop." >&2
 last=$(fingerprint)

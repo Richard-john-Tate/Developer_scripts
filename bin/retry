@@ -55,6 +55,8 @@ done
 for value in "$attempts" "$delay" "$max_delay" "$backoff"; do
   case $value in ''|*[!0-9]*) usage_error "option values must be whole numbers, got '$value'" ;; esac
 done
+# Force base 10, or bash reads "08" as a bad octal number.
+attempts=$((10#$attempts)) delay=$((10#$delay)) max_delay=$((10#$max_delay)) backoff=$((10#$backoff))
 
 say() { [ "$quiet" -eq 1 ] || printf '%s: %s\n' "$PROG" "$*" >&2; }
 

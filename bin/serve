@@ -3,6 +3,7 @@
 # serve: serve a directory over HTTP for quick local testing.
 #
 set -euo pipefail
+unset CDPATH   # so "cd dir" never jumps somewhere else
 
 readonly PROG=${0##*/}
 
@@ -48,7 +49,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -d "$dir" ] || die "not a directory: $dir"
-cd "$dir"
+cd -- "$dir"
 
 # True if something is already accepting connections on the port.
 port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }

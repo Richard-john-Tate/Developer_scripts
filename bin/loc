@@ -3,6 +3,7 @@
 # loc: count lines of code, grouped by file type.
 #
 set -euo pipefail
+unset CDPATH   # so "cd dir" never jumps somewhere else
 
 readonly PROG=${0##*/}
 
@@ -43,7 +44,7 @@ while [ $# -gt 0 ]; do
 done
 case $top in ''|*[!0-9]*) usage_error "--count must be a whole number" ;; esac
 [ -d "$dir" ] || die "not a directory: $dir"
-cd "$dir"
+cd -- "$dir"
 
 list=$(mktemp "${TMPDIR:-/tmp}/loc.XXXXXX")
 trap 'rm -f "$list"' EXIT

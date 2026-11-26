@@ -71,7 +71,10 @@ if [ "$git" -eq 1 ]; then
   exit 0
 fi
 
-set -- "$dir"
+# -H follows DIR if it's a symlink; -mindepth 1 stops DIR itself being
+# skipped when it is called, say, .cache or venv.
+case $dir in -*) dir=./$dir ;; esac
+set -- -H "$dir" -mindepth 1
 if [ "$all" -eq 0 ]; then
   set -- "$@" \( -name .git -o -name node_modules -o -name .venv -o -name venv \
     -o -name __pycache__ -o -name .tox -o -name .cache -o -name .gradle \
@@ -79,9 +82,15 @@ if [ "$all" -eq 0 ]; then
 fi
 set -- "$@" -type f
 
-# GNU find can print sizes itself; elsewhere (macOS, BSD) ask stat.
-if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
-  find "$@" -printf '%s\t%p\n' 2>/dev/null | report
-else
-  find "$@" -exec stat -f '%z%t%N' {} + 2>/dev/null | report
-fi
+# GNU find prints sizes itself. Otherwise ask stat, which is GNU stat if
+# coreutils is installed (e.g. via Homebrew) and BSD stat if not. find exits
+# non-zero if it meets an unreadable folder; the rest of the list still counts.
+{
+  if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    find "$@" -printf '%s\t%p\n'
+  elif stat -c %s / >/dev/null 2>&1; then
+    find "$@" -exec stat --printf '%s\t%n\n' {} +
+  else
+    find "$@" -exec stat -f '%z%t%N' {} +
+  fi 2>/dev/null || true
+} | report

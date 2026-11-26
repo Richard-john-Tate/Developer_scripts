@@ -92,7 +92,7 @@ if git show-ref --verify --quiet "refs/heads/$base"; then
   if git fetch --quiet . "refs/remotes/$upstream:refs/heads/$base" 2>/dev/null; then
     step "Local $base now matches $upstream"
   else
-    printf 'warning: local %s has commits that are not on %s; leaving it alone\n' "$base" "$upstream" >&2
+    printf 'warning: could not fast-forward local %s (it has commits that are not on %s,\n         or it is checked out in another worktree); leaving it alone\n' "$base" "$upstream" >&2
   fi
 fi
 

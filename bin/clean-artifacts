@@ -3,15 +3,16 @@
 # clean-artifacts: reclaim disk space from dependency and build folders.
 #
 set -euo pipefail
+unset CDPATH
 
 readonly PROG=${0##*/}
 
 # Folders that only ever hold downloaded dependencies or caches.
 SAFE_NAMES='node_modules __pycache__ .pytest_cache .mypy_cache .ruff_cache
-.tox .nox .next .nuxt .parcel-cache .turbo .svelte-kit .angular .gradle
+.tox .nox .next .nuxt .parcel-cache .turbo .svelte-kit .angular
 .dart_tool .eggs .sass-cache .terraform'
 # Common build-output names that might, in some projects, be real source.
-# Only with --aggressive, and never if git tracks anything inside them.
+# Only with --aggressive.
 AGGRESSIVE_NAMES='build dist out coverage .venv venv htmlcov'
 
 usage() {
@@ -25,12 +26,15 @@ cargo build and so on.
 
 Always cleaned:
 $(printf '%s\n' "$SAFE_NAMES" | tr '\n' ' ' | fold -s -w 66 | sed 's/ *$//; s/^/  /')
-  target  (only next to a Cargo.toml or pom.xml)
+  target   (only next to a Cargo.toml or pom.xml)
+  .gradle  (only next to a build.gradle or settings.gradle, so your
+           ~/.gradle settings are left alone)
 
 With --aggressive, also:
   $AGGRESSIVE_NAMES
 
-Folders that contain files tracked by git are never deleted.
+A folder is never deleted if git tracks any file in it, if it contains a
+git repository of its own, or if git can't say for sure.
 
 Options:
   -a, --aggressive  also clean the build-output folders listed above
@@ -62,13 +66,16 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -d "$dir" ] || die "not a directory: $dir"
+case $dir in -*) dir=./$dir ;; esac
 
-names="$SAFE_NAMES target"
+names="$SAFE_NAMES target .gradle"
 [ "$aggressive" -eq 0 ] || names="$names $AGGRESSIVE_NAMES"
 
-# Build: find DIR ( -name .git -prune ) -o -type d ( -name a -o -name b ... ) -prune -print0
+# find -H DIR -mindepth 1 ( -name .git -prune ) -o -type d ( -name a -o ... ) -prune -print0
+# -H follows DIR if it is a symlink; -mindepth 1 means DIR itself is never
+# a candidate, only folders below it.
 set -f   # the names must not be glob-expanded
-set -- "$dir" -name .git -prune -o -type d \(
+set -- -H "$dir" -mindepth 1 -name .git -prune -o -type d \(
 first=1
 for name in $names; do
   if [ $first -eq 1 ]; then first=0; else set -- "$@" -o; fi
@@ -77,35 +84,63 @@ done
 set -- "$@" \) -prune -print0
 set +f
 
-# True if git tracks any file inside the folder.
-tracked_by_git() {
-  local parent
-  parent=$(dirname "$1")
-  git -C "$parent" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
-  [ -n "$(git -C "$parent" ls-files -- "$(basename "$1")" 2>/dev/null | head -n 1)" ]
+git_ro() { git -c safe.directory='*' "$@"; }   # read-only queries; trust any owner
+
+# True if any folder from $1 up to / has a .git in it.
+in_a_repo() {
+  local d
+  d=$(cd -P -- "$1" 2>/dev/null && pwd -P) || return 0
+  while :; do
+    [ ! -e "$d/.git" ] || return 0
+    [ "$d" != / ] || return 1
+    d=$(dirname -- "$d")
+  done
+}
+
+# Prints why a folder must be kept, or nothing if it's safe to delete.
+# Fails closed: when git can't answer, keep the folder.
+keep_reason() {
+  local path=$1 parent base tracked
+  parent=$(dirname -- "$path")
+  base=$(basename -- "$path")
+
+  if [ -n "$(find "$path" -name .git -print 2>/dev/null | head -n 1)" ]; then
+    echo "contains a git repository"; return
+  fi
+  if ! git_ro -C "$parent" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if in_a_repo "$parent"; then echo "inside a git repo that git can't read"; fi
+    return
+  fi
+  if ! tracked=$(git_ro -C "$parent" ls-files -- "$base" 2>/dev/null); then
+    echo "git couldn't list its files"; return
+  fi
+  if [ -n "$tracked" ]; then echo "git tracks files in it"; fi
 }
 
 human() { awk -v k="$1" 'BEGIN { split("K M G T", u, " "); i = 1
   while (k >= 1024 && i < 4) { k /= 1024; i++ }
-  printf (i == 1 ? "%d%s" : "%.1f%s"), k, u[i] }'; }
+  fmt = (i == 1) ? "%d%s" : "%.1f%s"
+  printf fmt, k, u[i] }'; }
 
 targets=() total_kb=0
 while IFS= read -r -d '' path; do
-  base=$(basename "$path")
-  if [ "$base" = target ]; then
-    parent=$(dirname "$path")
-    [ -f "$parent/Cargo.toml" ] || [ -f "$parent/pom.xml" ] || continue
-  fi
-  if tracked_by_git "$path"; then
-    echo "skipping $path (git tracks files in it)" >&2
+  parent=$(dirname -- "$path")
+  case $(basename -- "$path") in
+    target)  [ -f "$parent/Cargo.toml" ] || [ -f "$parent/pom.xml" ] || continue ;;
+    .gradle) [ -f "$parent/build.gradle" ] || [ -f "$parent/build.gradle.kts" ] ||
+             [ -f "$parent/settings.gradle" ] || [ -f "$parent/settings.gradle.kts" ] || continue ;;
+  esac
+  reason=$(keep_reason "$path")
+  if [ -n "$reason" ]; then
+    echo "skipping $path ($reason)" >&2
     continue
   fi
-  kb=$(du -sk "$path" 2>/dev/null | cut -f1)
+  kb=$({ du -sk "$path" 2>/dev/null || true; } | cut -f1)
   kb=${kb:-0}
   targets+=("$path")
   total_kb=$((total_kb + kb))
   printf '%8s  %s\n' "$(human "$kb")" "$path"
-done < <(find "$@" 2>/dev/null)
+done < <(find "$@" 2>/dev/null || true)
 
 if [ ${#targets[@]} -eq 0 ]; then
   echo "Nothing to clean under $dir."
