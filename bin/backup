@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# backup: make a quick timestamped copy of files or directories.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] PATH...
+
+Make a timestamped copy of each PATH before you change it:
+
+  config.yml  ->  config.yml.20261126-143002.bak
+  src/        ->  src.20261126-143002.tar.gz
+
+Files are copied with their permissions and times kept. Directories are
+packed into a .tar.gz unless you pass --copy.
+
+Options:
+  -d, --dest DIR  put backups in DIR instead of next to the original
+                  (you can also set BACKUP_DIR)
+  -c, --copy      copy directories as directories instead of packing them
+  -h, --help      show this help
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+dest=${BACKUP_DIR:-} copy=0 paths=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d|--dest) [ $# -ge 2 ] || usage_error "$1 needs a value"; dest=$2; shift ;;
+    -c|--copy) copy=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; paths+=("$@"); break ;;
+    -*)        usage_error "unknown option: $1" ;;
+    *)         paths+=("$1") ;;
+  esac
+  shift
+done
+[ ${#paths[@]} -gt 0 ] || usage_error "give at least one file or directory"
+
+if [ -n "$dest" ]; then
+  mkdir -p "$dest"
+  dest=$(cd "$dest" && pwd)
+fi
+
+stamp=$(date +%Y%m%d-%H%M%S)
+
+# Print a path that doesn't exist yet: $1$2, else $1-1$2, $1-2$2, ...
+unique() {
+  local candidate=$1$2 n=1
+  while [ -e "$candidate" ]; do
+    candidate=$1-$n$2
+    n=$((n + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+for path in "${paths[@]}"; do
+  [ -e "$path" ] || die "no such file or directory: $path"
+
+  # Work out the real name and parent, so "." and "dir/" back up properly.
+  if [ -d "$path" ]; then
+    abs=$(cd "$path" && pwd)
+  else
+    abs=$(cd "$(dirname "$path")" && pwd)/$(basename "$path")
+  fi
+  [ "$abs" != / ] || die "refusing to back up /"
+  name=$(basename "$abs")
+  parent=$(dirname "$abs")
+  out_dir=${dest:-$parent}
+
+  if [ -d "$abs" ] && [ "$copy" -eq 0 ]; then
+    out=$(unique "$out_dir/$name.$stamp" .tar.gz)
+    tar -czf "$out" -C "$parent" "$name"
+  elif [ -d "$abs" ]; then
+    out=$(unique "$out_dir/$name.$stamp" .bak)
+    cp -Rp "$abs" "$out"
+  else
+    out=$(unique "$out_dir/$name.$stamp" .bak)
+    cp -p "$abs" "$out"
+  fi
+  echo "$path -> $out"
+done

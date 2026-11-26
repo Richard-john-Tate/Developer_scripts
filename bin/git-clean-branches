@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# git-clean-branches: delete local branches that are already merged.
+#
+# Because it is named git-*, git runs it as a subcommand:  git clean-branches
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options]
+
+Delete local branches that have already been merged into the base branch.
+The current branch, the base branch and main/master/develop/trunk are never
+touched. You are shown the list and asked before anything is deleted.
+
+Options:
+  -b, --base BRANCH  branch to compare against (default: the remote's HEAD,
+                     else main, else master)
+  -r, --remote NAME  remote to use (default: origin)
+  -g, --gone         also delete branches whose upstream branch was deleted
+                     on the remote. Catches squash- and rebase-merged pull
+                     requests, which plain "merged" detection misses
+  -f, --fetch        run "git fetch --prune" first (useful with --gone)
+  -n, --dry-run      show what would be deleted, delete nothing
+  -y, --yes          don't ask for confirmation
+  -h, --help         show this help
+
+Examples:
+  git clean-branches -n          # preview
+  git clean-branches -fg         # fetch, then remove merged + gone branches
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  bold=$'\033[1m' yellow=$'\033[33m' reset=$'\033[0m'
+else
+  bold='' yellow='' reset=''
+fi
+
+base='' remote=origin gone=0 fetch=0 dry_run=0 yes=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -b|--base)    [ $# -ge 2 ] || usage_error "$1 needs a value"; base=$2; shift ;;
+    -r|--remote)  [ $# -ge 2 ] || usage_error "$1 needs a value"; remote=$2; shift ;;
+    -g|--gone)    gone=1 ;;
+    -f|--fetch)   fetch=1 ;;
+    -n|--dry-run) dry_run=1 ;;
+    -y|--yes)     yes=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -[!-]?*)      # split bundled short flags: -fg -> -f -g
+                  rest=${1#-?}; flag=${1%"$rest"}; shift
+                  set -- "$flag" "-$rest" "$@"; continue ;;
+    *)            usage_error "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
+
+branch_exists() { git show-ref --verify --quiet "refs/heads/$1"; }
+
+if [ "$fetch" -eq 1 ]; then
+  git fetch --prune --quiet "$remote" || die "git fetch from '$remote' failed"
+fi
+
+if [ -z "$base" ]; then
+  base=$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null || true)
+  base=${base#"$remote"/}
+  if [ -z "$base" ]; then
+    for candidate in main master; do
+      if branch_exists "$candidate"; then base=$candidate; break; fi
+    done
+  fi
+  [ -n "$base" ] || die "can't work out the base branch; pass one with --base"
+fi
+
+# Compare against the local base branch if there is one, else the remote's copy.
+if branch_exists "$base"; then
+  base_ref=$base
+elif git show-ref --verify --quiet "refs/remotes/$remote/$base"; then
+  base_ref=$remote/$base
+else
+  die "base branch '$base' not found locally or on '$remote'"
+fi
+
+current=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+
+is_protected() {
+  case $1 in
+    "$current"|"$base"|main|master|develop|development|trunk) return 0 ;;
+  esac
+  return 1
+}
+
+# Collect candidates as "branch<TAB>reason" lines; merged first so a branch
+# that is both merged and gone is deleted with the safe "git branch -d".
+candidates=$(
+  {
+    git for-each-ref --merged "$base_ref" --format='%(refname:short)%09merged' refs/heads/
+    if [ "$gone" -eq 1 ]; then
+      git for-each-ref --format='%(refname:short)%09%(upstream:track)' refs/heads/ |
+        awk -F'\t' '$2 == "[gone]" { print $1 "\tgone" }'
+    fi
+  } | awk -F'\t' '!seen[$1]++'
+)
+
+to_delete=''
+count=0
+while IFS=$'\t' read -r branch reason; do
+  [ -n "$branch" ] || continue
+  is_protected "$branch" && continue
+  to_delete="$to_delete$branch"$'\t'"$reason"$'\n'
+  count=$((count + 1))
+done <<EOF
+$candidates
+EOF
+
+if [ "$count" -eq 0 ]; then
+  echo "Nothing to clean: no branches merged into '$base_ref'$([ "$gone" -eq 1 ] && echo ' or gone from the remote')."
+  exit 0
+fi
+
+echo "${bold}Branches to delete${reset} (base: $base_ref):"
+printf '%s' "$to_delete" | while IFS=$'\t' read -r branch reason; do
+  if [ "$reason" = gone ]; then
+    printf '  %s  %s(upstream gone; not merged into %s)%s\n' "$branch" "$yellow" "$base_ref" "$reset"
+  else
+    printf '  %s\n' "$branch"
+  fi
+done
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "(dry run: nothing deleted)"
+  exit 0
+fi
+
+if [ "$yes" -eq 0 ]; then
+  [ -t 0 ] || die "not a terminal, so can't ask for confirmation; re-run with --yes"
+  printf 'Delete %d branch(es)? [y/N] ' "$count"
+  read -r reply || reply=''
+  case $reply in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
+fi
+
+status=0
+while IFS=$'\t' read -r branch reason; do
+  [ -n "$branch" ] || continue
+  if [ "$reason" = gone ]; then
+    # Not merged as far as git can tell, so it needs -D. The "was <sha>" line
+    # git prints lets you restore it with: git branch <name> <sha>
+    git branch -D "$branch" || status=1
+  else
+    git branch -d "$branch" || status=1
+  fi
+done <<EOF
+$to_delete
+EOF
+exit "$status"

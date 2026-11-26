@@ -1,0 +1,144 @@
+# Developer scripts
+
+A toolbox of small, dependable command-line scripts for everyday
+development chores: tidying git branches, freeing a stuck port, waiting for
+a database to come up, unpacking an archive, finding what's eating your
+disk.
+
+Each script is a single self-contained bash file. Copy one into any folder
+on your `PATH` and it works on its own. All of them:
+
+- print a short manual with `--help`;
+- ask before deleting anything, and have a `--dry-run` where it matters;
+- exit with `0` on success, `1` on failure, `2` on a usage mistake;
+- turn off colour when the output isn't a terminal or `NO_COLOR` is set;
+- run on Linux and macOS (bash 3.2 or later, standard system tools).
+
+## The scripts
+
+### Git
+
+The `git-*` scripts become git subcommands once they're on your `PATH`, so
+you can type `git sync` instead of `git-sync`.
+
+| Command | What it does |
+| --- | --- |
+| [`git clean-branches`](bin/git-clean-branches) | Delete local branches already merged into main. `-g` also removes branches whose remote branch is gone, which catches squash-merged pull requests. |
+| [`git sync`](bin/git-sync) | Fetch, fast-forward your local main, and rebase the current branch onto it. Stashes and restores uncommitted work. |
+| [`git standup`](bin/git-standup) | Your commits since the last working day, across all branches. `-r ~/code` covers every repo in a folder. |
+
+### Ports, processes and servers
+
+| Command | What it does |
+| --- | --- |
+| [`ports`](bin/ports) | Which process is listening on which TCP port. |
+| [`killport`](bin/killport) | Kill whatever is holding a port. `killport 3000` |
+| [`wait-for`](bin/wait-for) | Wait until `host:port` or a URL is up, then run a command. Built for docker-compose entrypoints and CI. |
+| [`serve`](bin/serve) | Serve a folder over HTTP on `127.0.0.1`. Picks a free port if 8000 is taken. |
+| [`retry`](bin/retry) | Re-run a flaky command with exponential backoff. |
+| [`onchange`](bin/onchange) | Re-run a command whenever files change. `-r` restarts long-running servers. |
+
+### Files and disk space
+
+| Command | What it does |
+| --- | --- |
+| [`extract`](bin/extract) | Unpack any common archive: tar.gz, zip, xz, zst, 7z, rar and more. |
+| [`backup`](bin/backup) | Make a timestamped copy of a file, or a `.tar.gz` of a folder, before you change it. |
+| [`bigfiles`](bin/bigfiles) | The largest files in a folder. `-g` finds the largest files ever committed to a repo's history. |
+| [`clean-artifacts`](bin/clean-artifacts) | Find `node_modules`, `__pycache__`, `target` and similar folders, show their size, and delete them. Never deletes anything git tracks. |
+
+### Code and projects
+
+| Command | What it does |
+| --- | --- |
+| [`todos`](bin/todos) | List TODO, FIXME, HACK, XXX and BUG comments. `-c` just counts them. |
+| [`loc`](bin/loc) | Lines of code by file type. Inside a repo it counts only tracked files. |
+| [`envcheck`](bin/envcheck) | Compare `.env` against `.env.example`: missing, empty and extra keys. Prints key names only, never values. |
+| [`gensecret`](bin/gensecret) | Random passwords, hex keys, base64 tokens, PINs and UUIDs. |
+| [`mkscript`](bin/mkscript) | Start a new bash script with strict mode, `--help` and option parsing already written. |
+
+## Install
+
+```sh
+git clone https://github.com/Richard-john-Tate/Developer_scripts.git
+cd Developer_scripts
+./install.sh
+```
+
+This links every script into `~/.local/bin`. Because they're links,
+`git pull` keeps them up to date. The installer tells you if that folder
+isn't on your `PATH` yet and what line to add to your shell profile.
+
+Options:
+
+- `./install.sh --prefix /usr/local/bin` installs somewhere else.
+- `./install.sh --copy` copies the scripts instead of linking them.
+- `./install.sh --uninstall` removes only what the installer put there.
+
+You can also skip the installer and copy any single file from `bin/`.
+
+## Examples
+
+```sh
+# Git housekeeping
+git clean-branches -n            # preview which merged branches would go
+git clean-branches -fg           # fetch, then delete merged + squash-merged
+git sync                         # update main and rebase onto it
+git standup -d 7                 # everything you did this week
+
+# "Address already in use"
+ports 3000                       # who has it?
+killport 3000                    # make them let go
+
+# Containers and CI
+wait-for db:5432 redis:6379 -- ./start.sh
+retry -n 5 -d 2 -- curl -fsS https://example.com/health
+
+# Development loop
+serve -o dist                    # preview a static build in the browser
+onchange -e py -- pytest -q      # re-run tests on every save
+onchange -r -p src -- node app.js
+
+# Files
+extract release.tar.zst
+backup config.yml                # config.yml.20261126-143002.bak
+bigfiles -g -n 10                # what made this repo so big?
+clean-artifacts -n ~/code        # how much space would I get back?
+
+# Projects
+todos -c
+loc
+envcheck                         # exit status 1 if keys are missing
+gensecret -t hex 64
+mkscript deploy "Build and ship the site"
+```
+
+Run any command with `--help` for all its options.
+
+## Requirements
+
+Only bash and the tools that ship with Linux and macOS. A few features use
+an extra tool if it's there:
+
+| Script | Uses |
+| --- | --- |
+| `ports`, `killport` | `lsof`, or `ss`/`netstat`/`fuser` on Linux |
+| `serve` | `python3`, `php` or `busybox` |
+| `wait-for` | `curl` or `wget`, for URLs only |
+| `extract` | `unzip`, `zstd`, `7z` or `unrar` for those formats |
+| `todos` | `rg` (ripgrep), if installed, for speed and `.gitignore` support |
+
+## Development
+
+```sh
+make test     # run the test suite (tests/run.sh)
+make lint     # shellcheck every script
+make check    # both
+```
+
+The tests need only bash, git and the usual system tools. Tests that need
+an optional tool, such as `python3` or `zip`, are skipped if it's missing.
+Pass a name to run a subset: `tests/run.sh killport`.
+
+To add a script, start it with `bin/mkscript bin/my-tool "What it does"`
+so it matches the others, then add tests to `tests/run.sh`.

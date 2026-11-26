@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# onchange: re-run a command every time files change.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [--] COMMAND [ARGS...]
+
+Run COMMAND, then run it again whenever a file under the watched folder
+is added, removed or saved. Handy for tests, linters and builds while you
+edit. It polls for changes, so it needs no extra tools and works the same
+everywhere.
+
+.git, node_modules and other dependency and cache folders are ignored.
+
+Options:
+  -p, --path DIR      folder to watch (default: the current directory)
+  -e, --ext LIST      only watch these extensions, comma-separated
+                      (e.g. py,toml)
+  -i, --interval S    seconds between checks (default: 1)
+  -r, --restart       for long-running commands such as dev servers: stop
+                      the running command and start it again on change
+  -c, --clear         clear the screen before each run
+  -h, --help          show this help
+
+Examples:
+  $PROG -e py -- pytest -q
+  $PROG -c -e go go test ./...
+  $PROG -r -p src -- node server.js
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+watch_dir=. exts='' interval=1 restart=0 clear=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -p|--path)     [ $# -ge 2 ] || usage_error "$1 needs a value"; watch_dir=$2; shift ;;
+    -e|--ext)      [ $# -ge 2 ] || usage_error "$1 needs a value"; exts=$2; shift ;;
+    -i|--interval) [ $# -ge 2 ] || usage_error "$1 needs a value"; interval=$2; shift ;;
+    -r|--restart)  restart=1 ;;
+    -c|--clear)    clear=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            usage_error "unknown option: $1" ;;
+    *)             break ;;
+  esac
+  shift
+done
+[ $# -gt 0 ] || usage_error "no command given"
+[ -d "$watch_dir" ] || die "not a directory: $watch_dir"
+case $interval in ''|*[!0-9.]*) usage_error "--interval must be a number of seconds" ;; esac
+
+# find arguments: skip noisy folders, optionally keep only some extensions.
+find_args=("$watch_dir" \( -name .git -o -name node_modules -o -name __pycache__
+  -o -name .venv -o -name venv -o -name .pytest_cache -o -name .mypy_cache
+  -o -name .tox -o -name .next -o -name dist -o -name build -o -name target \)
+  -prune -o -type f)
+if [ -n "$exts" ]; then
+  find_args+=(\()
+  first=1
+  for ext in ${exts//,/ }; do
+    if [ $first -eq 1 ]; then first=0; else find_args+=(-o); fi
+    find_args+=(-name "*.${ext#.}")
+  done
+  find_args+=(\))
+fi
+
+if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
+  stat_files() { find "${find_args[@]}" -printf '%T@ %s %p\n' 2>/dev/null; }    # GNU
+else
+  stat_files() { find "${find_args[@]}" -exec stat -f '%m %z %N' {} + 2>/dev/null; }  # BSD/macOS
+fi
+# One short value that changes whenever any file's time, size or name does.
+fingerprint() { stat_files | LC_ALL=C sort | cksum; }
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  dim=$'\033[2m' green=$'\033[32m' red=$'\033[31m' reset=$'\033[0m'
+else
+  dim='' green='' red='' reset=''
+fi
+
+child=''
+stop_child() {
+  [ -n "$child" ] || return 0
+  if kill -0 "$child" 2>/dev/null; then
+    # Job control (set -m) put the command in its own process group, so
+    # this also stops anything it started, e.g. node under npm.
+    kill -TERM -- "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
+    local i=0
+    while kill -0 "$child" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -KILL -- "-$child" 2>/dev/null || true
+  fi
+  wait "$child" 2>/dev/null || true
+  child=''
+}
+
+run() {
+  [ "$clear" -eq 0 ] || printf '\033[H\033[2J'
+  printf '%s[%s] %s%s\n' "$dim" "$(date +%H:%M:%S)" "$*" "$reset" >&2
+  if [ "$restart" -eq 1 ]; then
+    stop_child
+    set -m
+    "$@" &
+    child=$!
+    set +m
+  else
+    local status=0
+    "$@" || status=$?
+    if [ "$status" -eq 0 ]; then
+      printf '%s[ok]%s\n' "$green" "$reset" >&2
+    else
+      printf '%s[exit %d]%s\n' "$red" "$status" "$reset" >&2
+    fi
+  fi
+}
+
+trap 'stop_child; exit 130' INT
+trap 'stop_child; exit 143' TERM
+
+echo "Watching $watch_dir${exts:+ (*.${exts//,/, *.})}. Press Ctrl-C to stop." >&2
+last=$(fingerprint)
+run "$@"
+while :; do
+  sleep "$interval"
+  now=$(fingerprint)
+  if [ "$now" != "$last" ]; then
+    last=$now
+    run "$@"
+    # Don't re-run for changes the command itself made (build output, etc.).
+    last=$(fingerprint)
+  fi
+done

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# todos: find TODO, FIXME, HACK and friends in your code.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [PATH...]
+
+List every TODO, FIXME, HACK, XXX and BUG marker under PATH (default: the
+current directory), with file and line number.
+
+Uses ripgrep if installed, else "git grep" inside a git repo, else grep.
+The first two skip files ignored by .gitignore.
+
+Options:
+  -t, --tags LIST  comma-separated markers to look for
+                   (default: TODO,FIXME,HACK,XXX,BUG)
+  -c, --count      show only how many of each marker there are
+  -h, --help       show this help
+
+Examples:
+  $PROG src
+  $PROG -c                 # how much debt is there?
+  $PROG -t FIXME,SECURITY
+EOF
+}
+
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+tags=TODO,FIXME,HACK,XXX,BUG count=0 paths=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -t|--tags)  [ $# -ge 2 ] || usage_error "$1 needs a value"; tags=$2; shift ;;
+    -c|--count) count=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    --)         shift; paths+=("$@"); break ;;
+    -*)         usage_error "unknown option: $1" ;;
+    *)          paths+=("$1") ;;
+  esac
+  shift
+done
+[ ${#paths[@]} -gt 0 ] || paths=(.)
+
+case $tags in *[!A-Za-z0-9_,]*|'') usage_error "--tags takes words separated by commas" ;; esac
+pattern=$(printf '%s' "$tags" | sed 's/,,*/|/g; s/^|//; s/|$//')
+
+color=never
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then color=always; fi
+
+# Run the search. With "count" print only the matched words, one per line.
+search() {
+  local mode=$1
+  if have rg; then
+    if [ "$mode" = count ]; then
+      set -- --only-matching --no-filename --no-line-number --color never
+    else
+      set -- --no-heading --line-number --color "$color"
+    fi
+    rg "$@" -w -e "$pattern" -- "${paths[@]}"
+  elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ "$mode" = count ]; then
+      set -- --only-matching -h --color=never
+    else
+      set -- --line-number --color="$color"
+    fi
+    git --no-pager grep "$@" -I -w -E -e "$pattern" -- "${paths[@]}"
+  else
+    if [ "$mode" = count ]; then
+      set -- --only-matching -h --color=never
+    else
+      set -- --line-number --color="$color"
+    fi
+    grep -rI "$@" -w -E \
+      --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv \
+      --exclude-dir=venv --exclude-dir=vendor --exclude-dir=dist --exclude-dir=build \
+      -e "$pattern" -- "${paths[@]}"
+  fi
+}
+
+# All three tools exit 1 when nothing matches, 2 or more on a real error.
+status=0
+if [ "$count" -eq 1 ]; then
+  results=$(search count) || status=$?
+  [ "$status" -le 1 ] || exit "$status"
+  if [ -n "$results" ]; then
+    printf '%s\n' "$results" | sort | uniq -c | sort -rn
+  fi
+else
+  search list || status=$?
+  [ "$status" -le 1 ] || exit "$status"
+fi
+[ "$status" -eq 0 ] || echo "No ${tags//,/, } markers found." >&2

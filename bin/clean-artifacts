@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# clean-artifacts: reclaim disk space from dependency and build folders.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+# Folders that only ever hold downloaded dependencies or caches.
+SAFE_NAMES='node_modules __pycache__ .pytest_cache .mypy_cache .ruff_cache
+.tox .nox .next .nuxt .parcel-cache .turbo .svelte-kit .angular .gradle
+.dart_tool .eggs .sass-cache .terraform'
+# Common build-output names that might, in some projects, be real source.
+# Only with --aggressive, and never if git tracks anything inside them.
+AGGRESSIVE_NAMES='build dist out coverage .venv venv htmlcov'
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [DIR]
+
+Find dependency, cache and build folders under DIR (default: the current
+directory), show how much space they use, and delete them after you
+confirm. Everything here can be rebuilt with npm install, pip install,
+cargo build and so on.
+
+Always cleaned:
+$(printf '%s\n' "$SAFE_NAMES" | tr '\n' ' ' | fold -s -w 66 | sed 's/ *$//; s/^/  /')
+  target  (only next to a Cargo.toml or pom.xml)
+
+With --aggressive, also:
+  $AGGRESSIVE_NAMES
+
+Folders that contain files tracked by git are never deleted.
+
+Options:
+  -a, --aggressive  also clean the build-output folders listed above
+  -n, --dry-run     list what would be deleted, delete nothing
+  -y, --yes         don't ask for confirmation
+  -h, --help        show this help
+
+Examples:
+  $PROG -n ~/code     # how much would I get back?
+  $PROG -y            # clean this project now
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+aggressive=0 dry_run=0 yes=0 dir=.
+while [ $# -gt 0 ]; do
+  case $1 in
+    -a|--aggressive) aggressive=1 ;;
+    -n|--dry-run)    dry_run=1 ;;
+    -y|--yes)        yes=1 ;;
+    -h|--help)       usage; exit 0 ;;
+    -[!-]?*)         rest=${1#-?}; flag=${1%"$rest"}; shift
+                     set -- "$flag" "-$rest" "$@"; continue ;;   # -ny -> -n -y
+    -*)              usage_error "unknown option: $1" ;;
+    *)               dir=$1 ;;
+  esac
+  shift
+done
+[ -d "$dir" ] || die "not a directory: $dir"
+
+names="$SAFE_NAMES target"
+[ "$aggressive" -eq 0 ] || names="$names $AGGRESSIVE_NAMES"
+
+# Build: find DIR ( -name .git -prune ) -o -type d ( -name a -o -name b ... ) -prune -print0
+set -f   # the names must not be glob-expanded
+set -- "$dir" -name .git -prune -o -type d \(
+first=1
+for name in $names; do
+  if [ $first -eq 1 ]; then first=0; else set -- "$@" -o; fi
+  set -- "$@" -name "$name"
+done
+set -- "$@" \) -prune -print0
+set +f
+
+# True if git tracks any file inside the folder.
+tracked_by_git() {
+  local parent
+  parent=$(dirname "$1")
+  git -C "$parent" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  [ -n "$(git -C "$parent" ls-files -- "$(basename "$1")" 2>/dev/null | head -n 1)" ]
+}
+
+human() { awk -v k="$1" 'BEGIN { split("K M G T", u, " "); i = 1
+  while (k >= 1024 && i < 4) { k /= 1024; i++ }
+  printf (i == 1 ? "%d%s" : "%.1f%s"), k, u[i] }'; }
+
+targets=() total_kb=0
+while IFS= read -r -d '' path; do
+  base=$(basename "$path")
+  if [ "$base" = target ]; then
+    parent=$(dirname "$path")
+    [ -f "$parent/Cargo.toml" ] || [ -f "$parent/pom.xml" ] || continue
+  fi
+  if tracked_by_git "$path"; then
+    echo "skipping $path (git tracks files in it)" >&2
+    continue
+  fi
+  kb=$(du -sk "$path" 2>/dev/null | cut -f1)
+  kb=${kb:-0}
+  targets+=("$path")
+  total_kb=$((total_kb + kb))
+  printf '%8s  %s\n' "$(human "$kb")" "$path"
+done < <(find "$@" 2>/dev/null)
+
+if [ ${#targets[@]} -eq 0 ]; then
+  echo "Nothing to clean under $dir."
+  exit 0
+fi
+
+echo "Total: $(human "$total_kb") in ${#targets[@]} folder(s)"
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "(dry run: nothing deleted)"
+  exit 0
+fi
+
+if [ "$yes" -eq 0 ]; then
+  [ -t 0 ] || die "not a terminal, so can't ask for confirmation; re-run with --yes"
+  printf 'Delete these %d folder(s)? [y/N] ' "${#targets[@]}"
+  read -r reply || reply=''
+  case $reply in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
+fi
+
+for path in "${targets[@]}"; do
+  rm -rf -- "$path"
+done
+echo "Deleted ${#targets[@]} folder(s), freed about $(human "$total_kb")."

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# serve: serve a directory over HTTP for quick local testing.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [DIR]
+
+Serve DIR (default: the current directory) over HTTP. Uses Python 3 if it
+is installed, else PHP, else BusyBox.
+
+It listens on 127.0.0.1 only, so other machines can't reach it. Use
+--bind 0.0.0.0 to share it on your network.
+
+Options:
+  -p, --port PORT  port to listen on (default: 8000, or the next free port
+                   after it)
+  -b, --bind ADDR  address to listen on (default: 127.0.0.1)
+  -o, --open       open the page in your web browser
+  -h, --help       show this help
+
+Examples:
+  $PROG                 # http://127.0.0.1:8000/
+  $PROG -o dist         # serve ./dist and open it in the browser
+  $PROG -b 0.0.0.0 -p 9000
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+port='' bind=127.0.0.1 open=0 dir=.
+while [ $# -gt 0 ]; do
+  case $1 in
+    -p|--port) [ $# -ge 2 ] || usage_error "$1 needs a value"; port=$2; shift ;;
+    -b|--bind) [ $# -ge 2 ] || usage_error "$1 needs a value"; bind=$2; shift ;;
+    -o|--open) open=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        usage_error "unknown option: $1" ;;
+    *)         dir=$1 ;;
+  esac
+  shift
+done
+
+[ -d "$dir" ] || die "not a directory: $dir"
+cd "$dir"
+
+# True if something is already accepting connections on the port.
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+if [ -z "$port" ]; then
+  port=8000
+  while port_in_use "$port"; do
+    port=$((port + 1))
+    [ "$port" -lt 8100 ] || die "no free port between 8000 and 8099; pick one with --port"
+  done
+else
+  case $port in ''|*[!0-9]*) usage_error "not a port number: $port" ;; esac
+  ! port_in_use "$port" || die "port $port is already in use (see: ports $port)"
+fi
+
+case $bind in
+  0.0.0.0|::) host=localhost ;;
+  *:*)        host="[$bind]" ;;   # IPv6 literal
+  *)          host=$bind ;;
+esac
+url="http://$host:$port/"
+
+if [ "$open" -eq 1 ]; then
+  if have xdg-open; then opener=xdg-open
+  elif have open; then opener=open
+  else opener=''; echo "$PROG: no xdg-open or open command; browse to $url yourself" >&2
+  fi
+  # Give the server a moment to start before the browser asks for the page.
+  if [ -n "$opener" ]; then (sleep 1; "$opener" "$url" >/dev/null 2>&1) & fi
+fi
+
+echo "Serving $(pwd) at $url  (Ctrl-C to stop)"
+
+python_ok() { "$1" -c 'import sys; sys.exit(sys.version_info[0] < 3)' 2>/dev/null; }
+
+if have python3 && python_ok python3; then
+  exec python3 -m http.server "$port" --bind "$bind"
+elif have python && python_ok python; then
+  exec python -m http.server "$port" --bind "$bind"
+elif have php; then
+  exec php -S "$bind:$port" -t .
+elif have busybox; then
+  exec busybox httpd -f -v -p "$bind:$port" -h .
+else
+  die "need python3, php or busybox to serve files"
+fi

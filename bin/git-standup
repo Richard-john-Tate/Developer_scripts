@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# git-standup: what did I commit since the last working day?
+#
+# Because it is named git-*, git runs it as a subcommand:  git standup
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options]
+
+List your commits since the start of the last working day, across all
+branches. On a Monday it looks back to Friday.
+
+Options:
+  -d, --days N         look back N days, counted from midnight
+                       (default: back to the last weekday, so 1 normally
+                       and 3 on a Monday)
+  -a, --author TEXT    whose commits to show; matches name or email
+                       (default: your git user.email)
+  -A, --everyone       show commits from every author
+  -r, --recursive DIR  report on every git repository under DIR
+                       (searches up to 3 levels deep)
+  -h, --help           show this help
+
+Examples:
+  git standup                  # yesterday (or Friday) until now
+  git standup -d 7 -A          # the whole team's week
+  git standup -r ~/code        # every repo under ~/code
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+days='' author='' everyone=0 root=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d|--days)      [ $# -ge 2 ] || usage_error "$1 needs a value"; days=$2; shift ;;
+    -a|--author)    [ $# -ge 2 ] || usage_error "$1 needs a value"; author=$2; shift ;;
+    -A|--everyone)  everyone=1 ;;
+    -r|--recursive) [ $# -ge 2 ] || usage_error "$1 needs a value"; root=$2; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              usage_error "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+if [ -z "$days" ]; then
+  # date +%u: 1 = Monday ... 7 = Sunday
+  case $(date +%u) in
+    1) days=3 ;;
+    7) days=2 ;;
+    *) days=1 ;;
+  esac
+fi
+case $days in
+  ''|*[!0-9]*) usage_error "--days must be a whole number, got '$days'" ;;
+esac
+
+if [ "$everyone" -eq 0 ] && [ -z "$author" ]; then
+  author=$(git config user.email 2>/dev/null || git config user.name 2>/dev/null || true)
+  [ -n "$author" ] || die "no git user.email/user.name set; pass --author or --everyone"
+fi
+
+color=never
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then color=always; fi
+
+# Print the log for one repository (the current directory).
+standup() {
+  set -- log --all --no-merges --color="$color" \
+    --since="$days days ago midnight" \
+    --format='%C(yellow)%h%C(reset) %s %C(green)(%cr)%C(reset)%C(dim) <%an>%C(reset)'
+  if [ "$everyone" -eq 0 ]; then
+    # --fixed-strings: an email like a.b+c@x.com is not meant as a regex.
+    set -- "$@" --fixed-strings --author="$author"
+  fi
+  git --no-pager "$@"
+}
+
+since_label="since $(if [ "$days" -eq 1 ]; then echo yesterday; else echo "$days days ago"; fi)"
+
+if [ -z "$root" ]; then
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository (use --recursive DIR to scan a folder)"
+  out=$(standup)
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    echo "No commits $since_label."
+  fi
+  exit 0
+fi
+
+[ -d "$root" ] || die "not a directory: $root"
+found=0
+# A repo's .git is a directory, or a file for worktrees and submodules.
+while IFS= read -r gitpath; do
+  repo=${gitpath%/.git}
+  out=$(cd "$repo" && standup 2>/dev/null) || continue
+  [ -n "$out" ] || continue
+  found=1
+  if [ "$color" = always ]; then
+    printf '\033[1;34m%s\033[0m\n' "$repo"
+  else
+    printf '%s\n' "$repo"
+  fi
+  printf '%s\n\n' "$out"
+done <<EOF
+$(find "$root" -maxdepth 4 -name .git -prune -print 2>/dev/null | sort)
+EOF
+
+[ "$found" -eq 1 ] || echo "No commits $since_label in any repository under $root."

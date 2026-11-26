@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# extract: unpack any common archive with one command.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] ARCHIVE...
+
+Unpack archives without remembering which tool and flags each format
+needs. Works out the format from the file name.
+
+Supported: .tar .tar.gz .tgz .tar.bz2 .tbz2 .tar.xz .txz .tar.zst .tzst
+           .tar.lz .tar.lzma .tar.Z .zip .jar .war .whl .gz .bz2 .xz
+           .zst .lzma .Z .7z .rar
+
+Options:
+  -d, --dest DIR   unpack into DIR (created if needed; default: the
+                   current directory)
+  -l, --list       list what's inside instead of unpacking
+  -h, --help       show this help
+
+Examples:
+  $PROG release.tar.gz
+  $PROG -d /tmp/src project.zip
+  $PROG -l backup.tar.xz
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { have "$1" || die "'$1' is needed for $2 files but isn't installed"; }
+
+dest=. list=0 archives=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d|--dest) [ $# -ge 2 ] || usage_error "$1 needs a value"; dest=$2; shift ;;
+    -l|--list) list=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; archives+=("$@"); break ;;
+    -*)        usage_error "unknown option: $1" ;;
+    *)         archives+=("$1") ;;
+  esac
+  shift
+done
+[ ${#archives[@]} -gt 0 ] || usage_error "give at least one archive"
+
+[ "$list" -eq 1 ] || mkdir -p "$dest"
+
+# Decompress a single compressed file (not a tarball) into $dest.
+#   $1 = archive, $2 = suffix to strip, $3... = decompress-to-stdout command
+unpack_single() {
+  local file=$1 suffix=$2 name out
+  shift 2
+  name=$(basename "$file")
+  name=${name%"$suffix"}
+  out=$dest/$name
+  [ ! -e "$out" ] || die "$out already exists; not overwriting"
+  if ! "$@" <"$file" >"$out"; then
+    rm -f "$out"
+    die "failed to decompress $file"
+  fi
+  echo "$file -> $out"
+}
+
+for archive in "${archives[@]}"; do
+  [ -f "$archive" ] || die "no such file: $archive"
+  lower=$(printf '%s' "$archive" | tr '[:upper:]' '[:lower:]')
+
+  if [ "$list" -eq 1 ]; then
+    case $lower in
+      *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz|*.tbz2|*.tar.xz|*.txz|*.tar.lzma|*.tar.lz|*.tar.z)
+        tar -tf "$archive" ;;
+      *.tar.zst|*.tzst)
+        need zstd zstd; zstd -dc "$archive" | tar -tf - ;;
+      *.zip|*.jar|*.war|*.ear|*.whl|*.apk|*.xpi)
+        need unzip zip; unzip -l "$archive" ;;
+      *.7z)  need 7z 7z; 7z l "$archive" ;;
+      *.rar) need unrar rar; unrar l "$archive" ;;
+      *.gz|*.bz2|*.xz|*.zst|*.lzma|*.z)
+        echo "$archive: a single compressed file, not an archive" ;;
+      *) die "don't know how to list '$archive'" ;;
+    esac
+    continue
+  fi
+
+  case $lower in
+    *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz|*.tbz2|*.tar.xz|*.txz|*.tar.lzma|*.tar.lz|*.tar.z)
+      # Modern GNU and BSD tar detect the compression themselves.
+      tar -xf "$archive" -C "$dest" ;;
+    *.tar.zst|*.tzst)
+      need zstd zstd; zstd -dc "$archive" | tar -xf - -C "$dest" ;;
+    *.zip|*.jar|*.war|*.ear|*.whl|*.apk|*.xpi)
+      need unzip zip; unzip -q "$archive" -d "$dest" ;;
+    *.7z)
+      need 7z 7z; 7z x -y -o"$dest" "$archive" >/dev/null ;;
+    *.rar)
+      need unrar rar; unrar x -idq "$archive" "$dest/" ;;
+    *.gz)   need gzip gzip;   unpack_single "$archive" "${archive: -3}" gzip -dc ;;
+    *.bz2)  need bzip2 bzip2; unpack_single "$archive" "${archive: -4}" bzip2 -dc ;;
+    *.xz)   need xz xz;       unpack_single "$archive" "${archive: -3}" xz -dc ;;
+    *.lzma) need xz lzma;     unpack_single "$archive" "${archive: -5}" xz --format=lzma -dc ;;
+    *.zst)  need zstd zstd;   unpack_single "$archive" "${archive: -4}" zstd -dc ;;
+    *.z)    need gzip Z;      unpack_single "$archive" "${archive: -2}" gzip -dc ;;
+    *)      die "don't know how to extract '$archive'" ;;
+  esac
+  case $lower in *.gz|*.bz2|*.xz|*.lzma|*.zst|*.z) ;; *) echo "$archive -> $dest/" ;; esac
+done

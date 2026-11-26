@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+# killport: kill whatever is listening on a TCP port.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] PORT...
+
+Kill the process(es) listening on the given TCP port(s). Sends SIGTERM,
+waits up to 5 seconds, and tells you if anything is still running.
+
+Options:
+  -s, --signal SIG  signal to send, by name or number (default: TERM)
+  -9                shorthand for --signal KILL
+  -n, --dry-run     show what would be killed, kill nothing
+  -h, --help        show this help
+
+Examples:
+  $PROG 3000           # free up port 3000
+  $PROG -9 8080 8443   # force-kill two ports
+
+See also: ports
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+signal=TERM dry_run=0 ports=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -s|--signal)  [ $# -ge 2 ] || usage_error "$1 needs a value"; signal=${2#SIG}; shift ;;
+    -9)           signal=KILL ;;
+    -n|--dry-run) dry_run=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; ports="$ports $*"; break ;;
+    -*)           usage_error "unknown option: $1" ;;
+    *)            ports="$ports $1" ;;
+  esac
+  shift
+done
+
+[ -n "${ports// /}" ] || usage_error "give at least one port"
+for port in $ports; do
+  case $port in
+    *[!0-9]*) usage_error "not a port number: $port" ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || usage_error "port out of range: $port"
+done
+
+# Print the PIDs listening on a port, one per line.
+pids_on() {
+  if have lsof; then
+    lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true
+  elif have ss; then
+    ss -Htlnp "sport = :$1" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 || true
+  elif have fuser; then
+    fuser -n tcp "$1" 2>/dev/null | tr -s ' ' '\n' | grep . || true
+  else
+    die "need one of lsof, ss or fuser"
+  fi
+}
+
+describe() { ps -o pid= -o user= -o command= -p "$1" 2>/dev/null | sed 's/^ *//' | cut -c1-150 || echo "$1 (gone)"; }
+
+status=0
+for port in $ports; do
+  pids=$(pids_on "$port" | sort -un)
+  if [ -z "$pids" ]; then
+    echo "Port $port: nothing listening (that you can see)"
+    [ "$(id -u)" -eq 0 ] || echo "  (other users' processes need sudo)"
+    status=1
+    continue
+  fi
+
+  echo "Port $port:"
+  for pid in $pids; do
+    echo "  $(describe "$pid")"
+  done
+  [ "$dry_run" -eq 0 ] || continue
+
+  for pid in $pids; do
+    kill -s "$signal" "$pid" 2>/dev/null || { echo "  could not signal $pid (permission denied?)" >&2; status=1; }
+  done
+
+  # Signals like HUP or USR1 aren't meant to stop the process; don't wait.
+  case $signal in
+    TERM|term|15|KILL|kill|9|INT|int|2|QUIT|quit|3) ;;
+    *) echo "  sent SIG$signal"; continue ;;
+  esac
+
+  # Give processes up to 5 seconds to exit.
+  i=0
+  while [ $i -lt 50 ]; do
+    alive=''
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then alive="$alive $pid"; fi
+    done
+    [ -n "$alive" ] || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  if [ -n "$alive" ]; then
+    echo "  still running:$alive (try: $PROG -9 $port)" >&2
+    status=1
+  else
+    echo "  killed (SIG$signal)"
+  fi
+done
+
+[ "$dry_run" -eq 0 ] || echo "(dry run: nothing killed)"
+exit "$status"
