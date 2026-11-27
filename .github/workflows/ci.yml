@@ -24,6 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ffmpeg
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          else
+            command -v ffmpeg || brew install ffmpeg
+          fi
+
       # macOS ships bash 3.2 as /bin/bash, but the runner puts a newer
       # Homebrew bash first on PATH. Put the old one first so the tests
       # check that the scripts still work with what Mac users actually have.
@@ -38,6 +46,7 @@ jobs:
         run: |
           bash --version | head -n 1
           git --version
+          ffmpeg -version | head -n 1
 
       - name: Test
         run: make test

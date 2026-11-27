@@ -57,6 +57,23 @@ you can type `git sync` instead of `git-sync`.
 | [`gensecret`](bin/gensecret) | Random passwords, hex keys, base64 tokens, PINs and UUIDs. |
 | [`mkscript`](bin/mkscript) | Start a new bash script with strict mode, `--help` and option parsing already written. |
 
+### Video and audio (ffmpeg)
+
+Friendly front ends for the [ffmpeg](https://ffmpeg.org) jobs people look
+up every time. They all start with `ff`, so `ff<Tab>` lists them. They
+never overwrite a file unless you pass `--force`, and a failed run never
+leaves a half-written file behind.
+
+| Command | What it does |
+| --- | --- |
+| [`ffinfo`](bin/ffinfo) | A short, readable summary of a media file: length, size, codecs, resolution, frame rate, audio channels. |
+| [`ffshrink`](bin/ffshrink) | Make videos smaller for sharing (H.264 MP4). `-r 720` for 720p, `-s 25M` to fit an upload limit, `--hevc` for even smaller files. |
+| [`fftrim`](bin/fftrim) | Cut a clip from START to END. Instant and lossless by default; `--exact` for a frame-accurate cut. |
+| [`ffgif`](bin/ffgif) | Turn a video, or part of one, into a good-looking GIF using a custom colour palette. |
+| [`ffaudio`](bin/ffaudio) | Pull the soundtrack out of a video without re-encoding, or convert it to mp3, m4a, opus, flac or wav. |
+| [`ffthumbs`](bin/ffthumbs) | A thumbnail, N evenly spaced frames, or a contact sheet (`-s 4x4`) of a whole video. |
+| [`ffconcat`](bin/ffconcat) | Join clips end to end, losslessly when they match, or with `-r` for any mix of sizes and formats. |
+
 ## Install
 
 ```sh
@@ -105,6 +122,16 @@ backup config.yml                # config.yml.20261126-143002.bak
 bigfiles -g -n 10                # what made this repo so big?
 clean-artifacts -n ~/code        # how much space would I get back?
 
+# Video and audio
+ffinfo holiday.mov               # what's in this file?
+ffshrink -r 720 screen-recording.mov
+ffshrink -s 25M -o upload.mp4 gameplay.mkv
+fftrim talk.mp4 12:30 +45        # 45 seconds from 12:30
+ffgif -s 1:05 -t 4 -w 320 match.mp4 goal.gif
+ffaudio -t mp3 lecture.mp4
+ffthumbs -s 4x4 lecture.mp4      # contact sheet of the whole video
+ffconcat part1.mp4 part2.mp4 part3.mp4
+
 # Projects
 todos -c
 loc
@@ -127,6 +154,7 @@ an extra tool if it's there:
 | `wait-for` | `curl` or `wget`, for URLs only |
 | `extract` | `unzip`, `zstd`, `7z` or `unrar` for those formats |
 | `todos` | `rg` (ripgrep), if installed, for speed and `.gitignore` support |
+| `ff*` | `ffmpeg` and `ffprobe` (macOS: `brew install ffmpeg`; Debian/Ubuntu: `sudo apt install ffmpeg`) |
 
 ## Development
 
@@ -137,7 +165,8 @@ make check    # both
 ```
 
 The tests need only bash, git and the usual system tools. Tests that need
-an optional tool, such as `python3` or `zip`, are skipped if it's missing.
+an optional tool, such as `python3`, `zip` or `ffmpeg`, are skipped if it's
+missing.
 Pass a name to run a subset: `tests/run.sh killport`.
 
 To add a script, start it with `bin/mkscript bin/my-tool "What it does"`

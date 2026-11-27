@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+#
+# ffaudio: pull the soundtrack out of videos, or convert audio files.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] FILE...
+
+Save the audio from each FILE as its own file next to the original.
+
+By default the audio is copied exactly as it is, which is instant and
+loses nothing, into the file type that matches it:
+  AAC -> .m4a   MP3 -> .mp3   Opus -> .opus   Vorbis -> .ogg
+  FLAC -> .flac   anything else -> .mka (Matroska audio)
+
+Use --to to convert it instead, e.g. to MP3 for an old player.
+
+Options:
+  -t, --to FORMAT     convert to mp3, m4a, opus, flac or wav
+  -b, --bitrate RATE  bitrate for mp3, m4a and opus, e.g. 128k
+                      (default: 192k for mp3 and m4a, 128k for opus)
+  -o, --output FILE   where to write (only with a single FILE)
+  -f, --force         overwrite outputs that already exist
+  -h, --help          show this help
+
+Examples:
+  $PROG lecture.mp4               # lecture.m4a, a perfect copy
+  $PROG -t mp3 *.mov              # an MP3 for each video
+  $PROG -t flac -o master.flac session.mkv
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+to='' bitrate='' output='' force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -t|--to)      [ $# -ge 2 ] || usage_error "$1 needs a value"; to=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]'); shift ;;
+    -b|--bitrate) [ $# -ge 2 ] || usage_error "$1 needs a value"; bitrate=$2; shift ;;
+    -o|--output)  [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)   force=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; inputs+=("$@"); break ;;
+    -*)           usage_error "unknown option: $1" ;;
+    *)            inputs+=("$1") ;;
+  esac
+  shift
+done
+[ ${#inputs[@]} -gt 0 ] || usage_error "give at least one file"
+[ -z "$output" ] || [ ${#inputs[@]} -eq 1 ] || usage_error "--output only works with a single file"
+case $to in ''|mp3|m4a|opus|flac|wav) ;; *) usage_error "--to must be mp3, m4a, opus, flac or wav" ;; esac
+case $bitrate in ''|[0-9]*[kK]|[0-9]*) ;; *) usage_error "--bitrate looks like 128k" ;; esac
+[ -z "$bitrate" ] || [ -n "$to" ] || usage_error "--bitrate needs --to (copying keeps the original bitrate)"
+{ have ffmpeg && have ffprobe; } || die "needs ffmpeg (macOS: brew install ffmpeg; Debian/Ubuntu: sudo apt install ffmpeg)"
+
+# Codec of the first audio stream, or nothing if there isn't one.
+audio_codec() {
+  ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 -- "$1" 2>/dev/null | head -n 1
+}
+
+# Settle every output name and codec first, so nothing runs if one is bad.
+outputs=() codecs=()
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+  codec=$(audio_codec "$input" || true)
+  [ -n "$codec" ] || die "$input has no audio"
+
+  if [ -n "$to" ]; then
+    ext=$to
+  else
+    case $codec in
+      aac|alac) ext=m4a ;;
+      mp3)      ext=mp3 ;;
+      opus)     ext=opus ;;
+      vorbis)   ext=ogg ;;
+      flac)     ext=flac ;;
+      *)        ext=mka ;;
+    esac
+  fi
+
+  if [ -n "$output" ]; then
+    out=$output
+  else
+    dir=$(dirname -- "$input") base=$(basename -- "$input")
+    case $base in ?*.*) base=${base%.*} ;; esac
+    out=$base.$ext
+    [ "$dir" = . ] || out=$dir/$out
+  fi
+  case $out in -*) out=./$out ;; esac
+  if [ -e "$out" ]; then
+    [ ! "$out" -ef "$input" ] || die "$out is the input file; use --to to pick another format, or --output"
+    [ "$force" -eq 1 ] || die "$out already exists (use --force to overwrite)"
+  fi
+  outputs+=("$out")
+  codecs+=("$codec")
+done
+
+stats=-nostats
+[ -t 2 ] && stats=-stats
+partial=''
+trap '[ -z "$partial" ] || rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+status=0
+i=0
+for input in "${inputs[@]}"; do
+  out=${outputs[$i]} codec=${codecs[$i]}
+  i=$((i + 1))
+  case $input in -*) input=./$input ;; esac
+
+  case $to in
+    '')   set -- -c:a copy ;;
+    mp3)  set -- -c:a libmp3lame -b:a "${bitrate:-192k}" ;;
+    m4a)  set -- -c:a aac -b:a "${bitrate:-192k}" ;;
+    opus) set -- -c:a libopus -b:a "${bitrate:-128k}" ;;
+    flac) set -- -c:a flac ;;
+    wav)  set -- -c:a pcm_s16le ;;
+  esac
+
+  partial=$(dirname -- "$out")/.$(basename -- "$out").partial.$$.${out##*.}
+  # -vn and -sn: no video, cover art or subtitles, just the first audio track.
+  if ffmpeg -hide_banner -nostdin -loglevel error "$stats" -i "$input" \
+      -map 0:a:0 -vn -sn -dn "$@" -y "$partial"; then
+    mv -f "$partial" "$out"
+    if [ -z "$to" ]; then
+      echo "$input -> $out (copied $codec audio)"
+    else
+      echo "$input -> $out"
+    fi
+  else
+    rm -f "$partial"
+    printf '%s: failed to get the audio from %s\n' "$PROG" "$input" >&2
+    status=1
+  fi
+  partial=''
+done
+exit "$status"

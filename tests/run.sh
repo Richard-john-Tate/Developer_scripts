@@ -926,6 +926,168 @@ test_install_refuses_its_own_bin() {
   [ ! -L "$ROOT/bin/killport" ] || fail "replaced a script with a link to itself"
 }
 
+# --- ffmpeg scripts ---------------------------------------------------------
+
+need_ffmpeg() { { have ffmpeg && have ffprobe; } || skip "ffmpeg not installed"; }
+
+# make_video NAME SECONDS WxH [audio]  writes a small H.264 test clip.
+make_video() {
+  set -- "$1" "$2" "$3" "${4:-}"
+  if [ "$4" = audio ]; then
+    ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=duration=$2:size=$3:rate=25" \
+      -f lavfi -i "sine=duration=$2" -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+      -c:a aac -shortest "$1"
+  else
+    ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=duration=$2:size=$3:rate=25" \
+      -c:v libx264 -preset ultrafast -pix_fmt yuv420p "$1"
+  fi
+}
+media_duration() { ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$1"; }
+media_size() { ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$1"; }
+# about ACTUAL EXPECTED TOLERANCE: true if they're within TOLERANCE.
+about() { awk -v a="$1" -v e="$2" -v t="$3" 'BEGIN { d = a - e; if (d < 0) d = -d; exit !(d <= t) }'; }
+no_partials() { [ -z "$(find . -name '*.partial.*')" ] || fail "a .partial file was left behind"; }
+
+test_ffinfo_summary() {
+  need_ffmpeg
+  make_video clip.mp4 3 320x240 audio
+  run ffinfo clip.mp4
+  expect_status 0
+  expect_out "3.0s"
+  expect_out "video     h264 320x240 25 fps"
+  expect_out "audio     aac mono 44.1 kHz"
+  echo "not media" >notes.txt
+  run ffinfo notes.txt
+  expect_status 1
+  expect_out "not a media file"
+}
+
+test_ffshrink_scales_short_side_and_refuses_overwrite() {
+  need_ffmpeg
+  make_video tall.mp4 2 720x1280 audio
+  run ffshrink -r 480 -p ultrafast tall.mp4
+  expect_status 0
+  [ "$(media_size tall.small.mp4)" = 480x854 ] || fail "portrait video not scaled to 480p: $(media_size tall.small.mp4)"
+  run ffshrink -r 480 tall.mp4
+  expect_status 1
+  expect_out "already exists"
+  run ffshrink -r 2000 -m -p ultrafast -o big.mp4 tall.mp4
+  expect_status 0
+  [ "$(media_size big.mp4)" = 720x1280 ] || fail "video was enlarged"
+  [ -z "$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 big.mp4)" ] ||
+    fail "--mute left the audio in"
+  no_partials
+}
+
+test_ffshrink_target_size() {
+  need_ffmpeg
+  ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=duration=6:size=1280x720:rate=30 \
+    -c:v libx264 -crf 5 -preset ultrafast big.mp4
+  run ffshrink -s 300K -p ultrafast big.mp4
+  expect_status 0
+  size=$(wc -c <big.small.mp4 | tr -d ' ')
+  [ "$size" -le 300000 ] || fail "asked for 300K, got $size bytes"
+  [ "$size" -ge 150000 ] || fail "asked for 300K, got only $size bytes"
+  no_partials
+}
+
+test_ffshrink_bad_input_leaves_nothing() {
+  need_ffmpeg
+  echo "not a video" >fake.mp4
+  run ffshrink fake.mp4
+  expect_status 1
+  expect_no_file fake.small.mp4
+  no_partials
+}
+
+test_fftrim_exact_and_copy() {
+  need_ffmpeg
+  make_video long.mp4 10 320x240 audio
+  run fftrim -e long.mp4 2 +3
+  expect_status 0
+  about "$(media_duration long.clip.mp4)" 3 0.1 || fail "exact clip isn't 3s: $(media_duration long.clip.mp4)"
+  run fftrim long.mp4 0:06 -o end.mp4
+  expect_status 0
+  expect_file end.mp4
+  run fftrim long.mp4 8 5
+  expect_status 2
+  run fftrim long.mp4 99
+  expect_status 1
+  expect_out "past the end"
+  run fftrim long.mp4 1:2:3:4
+  expect_status 2
+}
+
+test_ffgif_makes_a_gif() {
+  need_ffmpeg
+  make_video clip.mp4 4 640x480
+  run ffgif -s 1 -t 2 -w 200 clip.mp4
+  expect_status 0
+  [ "$(media_size clip.gif)" = 200x150 ] || fail "wrong GIF size: $(media_size clip.gif)"
+  about "$(media_duration clip.gif)" 2 0.2 || fail "GIF isn't 2s long"
+  run ffgif clip.mp4 out.png
+  expect_status 2
+}
+
+test_ffaudio_copy_and_convert() {
+  need_ffmpeg
+  make_video talk.mp4 2 320x240 audio
+  make_video silent.mp4 1 320x240
+  run ffaudio talk.mp4
+  expect_status 0
+  expect_out "copied aac audio"
+  [ "$(ffprobe -v error -show_entries stream=codec_name -of csv=p=0 talk.m4a)" = aac ] || fail "talk.m4a isn't AAC"
+  run ffaudio -t mp3 talk.mp4
+  expect_status 0
+  [ "$(ffprobe -v error -show_entries stream=codec_name -of csv=p=0 talk.mp3)" = mp3 ] || fail "talk.mp3 isn't MP3"
+  run ffaudio silent.mp4
+  expect_status 1
+  expect_out "has no audio"
+  run ffaudio talk.m4a
+  expect_status 1
+  expect_out "is the input file"
+}
+
+test_ffthumbs_modes() {
+  need_ffmpeg
+  make_video film.mp4 10 640x360
+  run ffthumbs film.mp4
+  expect_status 0
+  [ "$(media_size film.thumb.jpg)" = 640x360 ] || fail "thumbnail has the wrong size"
+  run ffthumbs -n 3 -w 160 film.mp4
+  expect_status 0
+  for n in 01 02 03; do expect_file "film.thumb-$n.jpg"; done
+  [ "$(media_size film.thumb-02.jpg)" = 160x90 ] || fail "--width ignored"
+  run ffthumbs -s 3x2 -w 100 film.mp4
+  expect_status 0
+  # 3 tiles of 100 + 4 gaps of 4 = 316 wide; 2 tiles of 56 + 3 gaps = 124 high.
+  [ "$(media_size film.sheet.jpg)" = 316x124 ] || fail "contact sheet has the wrong size: $(media_size film.sheet.jpg)"
+  run ffthumbs -a 99 film.mp4 -f
+  expect_status 1
+  expect_out "past the end"
+}
+
+test_ffconcat_lossless_mismatch_and_reencode() {
+  need_ffmpeg
+  make_video "part 1.mp4" 2 320x240 audio
+  make_video "it's part 2.mp4" 3 320x240 audio
+  make_video portrait.mp4 2 240x320
+  run ffconcat -o joined.mp4 "part 1.mp4" "it's part 2.mp4"
+  expect_status 0
+  about "$(media_duration joined.mp4)" 5 0.2 || fail "joined file isn't 5s: $(media_duration joined.mp4)"
+
+  run ffconcat -o nope.mp4 "part 1.mp4" portrait.mp4
+  expect_status 1
+  expect_out "--reencode"
+  expect_no_file nope.mp4
+
+  run ffconcat -r -o mixed.mp4 "part 1.mp4" portrait.mp4 "it's part 2.mp4"
+  expect_status 0
+  about "$(media_duration mixed.mp4)" 7 0.2 || fail "re-encoded join isn't 7s: $(media_duration mixed.mp4)"
+  [ "$(media_size mixed.mp4)" = 320x240 ] || fail "not scaled to the first video's size"
+  no_partials
+}
+
 # --- runner -----------------------------------------------------------------
 
 filter=${1:-}

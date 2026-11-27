@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+#
+# ffthumbs: grab thumbnails, frames or a contact sheet from a video.
+#
+set -euo pipefail
+export LC_NUMERIC=C
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] VIDEO...
+
+Save still images from each VIDEO, next to it:
+
+  (default)       one thumbnail from 10% of the way in: NAME.thumb.jpg
+  --at TIME       the frame at TIME instead
+  --count N       N frames spread evenly through the video:
+                  NAME.thumb-01.jpg, NAME.thumb-02.jpg, ...
+  --sheet CxR     a contact sheet: C columns by R rows of evenly spaced
+                  frames in one image, NAME.sheet.jpg
+
+Options:
+  -a, --at TIME     seconds or [HH:]MM:SS
+  -n, --count N     how many frames
+  -s, --sheet CxR   columns x rows, e.g. 4x3
+  -w, --width PX    width of each image, or of each tile on a sheet
+                    (default: the video's own width; 320 for sheets)
+      --png         save PNG instead of JPEG
+  -f, --force       overwrite images that already exist
+  -h, --help        show this help
+
+Examples:
+  $PROG movie.mkv
+  $PROG -a 1:23 -w 1280 trailer.mp4
+  $PROG -s 4x4 lecture.mp4      # see a whole talk at a glance
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+at='' count='' sheet='' width='' ext=jpg force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -a|--at)    [ $# -ge 2 ] || usage_error "$1 needs a value"; at=$2; shift ;;
+    -n|--count) [ $# -ge 2 ] || usage_error "$1 needs a value"; count=$2; shift ;;
+    -s|--sheet) [ $# -ge 2 ] || usage_error "$1 needs a value"; sheet=$2; shift ;;
+    -w|--width) [ $# -ge 2 ] || usage_error "$1 needs a value"; width=$2; shift ;;
+    --png)      ext=png ;;
+    -f|--force) force=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    --)         shift; inputs+=("$@"); break ;;
+    -*)         usage_error "unknown option: $1" ;;
+    *)          inputs+=("$1") ;;
+  esac
+  shift
+done
+[ ${#inputs[@]} -gt 0 ] || usage_error "give at least one video"
+modes=0
+for m in "$at" "$count" "$sheet"; do [ -z "$m" ] || modes=$((modes + 1)); done
+[ "$modes" -le 1 ] || usage_error "use only one of --at, --count and --sheet"
+
+# Seconds from "90", "12.5", "1:30" or "01:02:03.5"; fails on anything else.
+to_seconds() {
+  printf '%s\n' "$1" | awk -F: '
+    NF < 1 || NF > 3 { exit 1 }
+    { for (i = 1; i <= NF; i++) if ($i !~ /^([0-9]+\.?[0-9]*|\.[0-9]+)$/) exit 1
+      s = 0; for (i = 1; i <= NF; i++) s = s * 60 + $i
+      printf "%.3f\n", s }'
+}
+
+if [ -n "$at" ]; then
+  at=$(to_seconds "$at") || usage_error "bad --at time (use seconds or [HH:]MM:SS)"
+fi
+if [ -n "$count" ]; then
+  case $count in ''|*[!0-9]*|0) usage_error "--count must be a whole number above 0" ;; esac
+  [ "$count" -le 999 ] || usage_error "--count is limited to 999"
+fi
+if [ -n "$sheet" ]; then
+  case $sheet in [1-9]*x[1-9]*) ;; *) usage_error "--sheet looks like 4x3 (columns x rows)" ;; esac
+  cols=${sheet%%x*} rows=${sheet#*x}
+  case $cols$rows in *[!0-9]*) usage_error "--sheet looks like 4x3 (columns x rows)" ;; esac
+  [ $((cols * rows)) -le 400 ] || usage_error "--sheet is limited to 400 frames"
+  width=${width:-320}
+fi
+case $width in ''|[1-9]|[1-9][0-9]*) ;; *) usage_error "--width must be a whole number of pixels" ;; esac
+case $width in *[!0-9]*) usage_error "--width must be a whole number of pixels" ;; esac
+{ have ffmpeg && have ffprobe; } || die "needs ffmpeg (macOS: brew install ffmpeg; Debian/Ubuntu: sudo apt install ffmpeg)"
+
+# The output path for one VIDEO and a suffix like "thumb" or "thumb-03".
+out_for() {
+  local dir base out
+  dir=$(dirname -- "$1") base=$(basename -- "$1")
+  case $base in ?*.*) base=${base%.*} ;; esac
+  out=$base.$2.$ext
+  [ "$dir" = . ] || out=$dir/$out
+  case $out in -*) out=./$out ;; esac
+  printf '%s\n' "$out"
+}
+
+# Check every output up front so nothing is written if any would clash.
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+  if [ -n "$count" ]; then
+    n=1
+    while [ "$n" -le "$count" ]; do
+      set -- "$@" "$(out_for "$input" "$(printf 'thumb-%02d' "$n")")"
+      n=$((n + 1))
+    done
+  elif [ -n "$sheet" ]; then
+    set -- "$@" "$(out_for "$input" sheet)"
+  else
+    set -- "$@" "$(out_for "$input" thumb)"
+  fi
+done
+if [ "$force" -eq 0 ]; then
+  for out in "$@"; do
+    [ ! -e "$out" ] || die "$out already exists (use --force to overwrite)"
+  done
+fi
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/ffthumbs.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+scale=''
+[ -z "$width" ] || scale="scale='min($width,iw)':-2"
+# JPEG quality 2 (of 31) is near-lossless. ${quality[@]+...} below expands an
+# empty array safely under set -u on bash 3.2, which macOS still ships.
+if [ "$ext" = jpg ]; then quality=(-q:v 2); else quality=(); fi
+
+# Save the frame at second $2 of video $1 to image $3. Seeking before -i is
+# fast even far into a long film; the next frame after that point is taken.
+grab() {
+  local video=$1 time=$2 image=$3
+  set -- -ss "$time" -i "$video" -frames:v 1 -update 1
+  [ -z "$scale" ] || set -- "$@" -vf "$scale"
+  ffmpeg -hide_banner -nostdin -loglevel error "$@" ${quality[@]+"${quality[@]}"} -y "$image"
+}
+
+# "Spread evenly" means the middle of each of N equal slices, so the first
+# frame isn't the (often black) very start and the last isn't the credits.
+spread() { awk -v d="$1" -v n="$2" -v i="$3" 'BEGIN { printf "%.3f", d * (i - 0.5) / n }'; }
+
+status=0
+for input in "${inputs[@]}"; do
+  ok=1   # this file's result; $status is the whole run's
+  out_count=''
+  case $input in -*) src=./$input ;; *) src=$input ;; esac
+  duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 -- "$src" 2>/dev/null || true)
+  case $duration in ''|*[!0-9.]*) duration='' ;; esac
+  if [ -z "$duration" ] && [ -z "$at" ]; then
+    printf '%s: %s: can'\''t tell how long it is; use --at to pick a time\n' "$PROG" "$input" >&2
+    status=1
+    continue
+  fi
+
+  if [ -n "$count" ]; then
+    n=1
+    while [ "$n" -le "$count" ]; do
+      out=$(out_for "$input" "$(printf 'thumb-%02d' "$n")")
+      if grab "$src" "$(spread "$duration" "$count" "$n")" "$work/frame.$ext"; then
+        mv -f "$work/frame.$ext" "$out"
+      else
+        ok=0
+      fi
+      n=$((n + 1))
+    done
+    out_count="$count images"
+  elif [ -n "$sheet" ]; then
+    out=$(out_for "$input" sheet)
+    frames=$((cols * rows)) n=1
+    while [ "$n" -le "$frames" ]; do
+      grab "$src" "$(spread "$duration" "$frames" "$n")" "$work/$(printf '%03d' "$n").png" || ok=0
+      n=$((n + 1))
+    done
+    # Tile the frames in order, with a thin dark border between them.
+    if ffmpeg -hide_banner -nostdin -loglevel error -framerate 1 -i "$work/%03d.png" \
+        -vf "tile=${cols}x${rows}:padding=4:margin=4:color=0x202020" -frames:v 1 -update 1 \
+        ${quality[@]+"${quality[@]}"} -y "$work/sheet.$ext"; then
+      mv -f "$work/sheet.$ext" "$out"
+    else
+      ok=0
+    fi
+    rm -f "$work"/*.png
+  else
+    out=$(out_for "$input" thumb)
+    time=${at:-$(awk -v d="$duration" 'BEGIN { printf "%.3f", d * 0.1 }')}
+    if [ -n "$duration" ] && ! awk -v t="$time" -v d="$duration" 'BEGIN { exit !(t < d) }'; then
+      printf '%s: %s: --at is past the end of the video\n' "$PROG" "$input" >&2
+      status=1
+      continue
+    fi
+    if grab "$src" "$time" "$work/frame.$ext" && [ -s "$work/frame.$ext" ]; then
+      mv -f "$work/frame.$ext" "$out"
+    else
+      ok=0
+    fi
+  fi
+
+  if [ "$ok" -eq 1 ]; then
+    echo "$input -> ${out_count:-$out}"
+  else
+    printf '%s: some images from %s could not be saved\n' "$PROG" "$input" >&2
+    status=1
+  fi
+done
+exit "$status"

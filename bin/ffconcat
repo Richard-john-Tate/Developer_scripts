@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+#
+# ffconcat: join video or audio files end to end.
+#
+set -euo pipefail
+unset CDPATH
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] FILE FILE...
+
+Join the files in the order given (default output: FIRST.joined.EXT next
+to the first file).
+
+By default nothing is re-encoded, so joining is instant and lossless. That
+needs every file to have the same codecs, picture size and audio format,
+which clips from the same camera, phone or recorder usually do. If they
+don't match, $PROG says how they differ. Then use --reencode, which
+converts everything to H.264 and AAC at the first video's size and frame
+rate (letterboxing any other shapes), so any mix of files can be joined.
+
+Options:
+  -r, --reencode     convert the files so that any mix can be joined
+  -o, --output FILE  where to write
+  -f, --force        overwrite the output if it already exists
+  -h, --help         show this help
+
+Examples:
+  $PROG part1.mp4 part2.mp4 part3.mp4
+  $PROG -r -o trip.mp4 phone.mov gopro.mp4 drone.mp4
+  $PROG -o audiobook.m4a chapter-*.m4a
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+reencode=0 output='' force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -r|--reencode) reencode=1 ;;
+    -o|--output)   [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)    force=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; inputs+=("$@"); break ;;
+    -*)            usage_error "unknown option: $1" ;;
+    *)             inputs+=("$1") ;;
+  esac
+  shift
+done
+[ ${#inputs[@]} -ge 2 ] || usage_error "give at least two files to join"
+{ have ffmpeg && have ffprobe; } || die "needs ffmpeg (macOS: brew install ffmpeg; Debian/Ubuntu: sudo apt install ffmpeg)"
+
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+done
+
+# "key=value" lines for the first stream of a type (v or a) in a file.
+probe() {
+  ffprobe -v error -select_streams "$2:0" -of default=nw=1 \
+    -show_entries stream=codec_name,width,height,pix_fmt,avg_frame_rate,sample_rate,channels -- "$1" 2>/dev/null
+}
+field() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
+# A one-line description of what must match for a lossless join.
+signature() {
+  local v a
+  v=$(probe "$1" v) a=$(probe "$1" a)
+  printf 'video: %s, audio: %s\n' \
+    "${v:+$(field "$v" codec_name) $(field "$v" width)x$(field "$v" height) $(field "$v" pix_fmt)}${v:-none}" \
+    "${a:+$(field "$a" codec_name) $(field "$a" sample_rate) Hz $(field "$a" channels) ch}${a:-none}"
+}
+
+first=${inputs[0]}
+if [ -z "$output" ]; then
+  dir=$(dirname -- "$first") base=$(basename -- "$first") ext=''
+  case $base in ?*.*) ext=.${base##*.}; base=${base%.*} ;; esac
+  [ "$reencode" -eq 0 ] || ext=.mp4
+  output=$base.joined$ext
+  [ "$dir" = . ] || output=$dir/$output
+fi
+case $output in -*) output=./$output ;; esac
+for input in "${inputs[@]}"; do
+  [ ! -e "$output" ] || [ ! "$output" -ef "$input" ] || die "the output can't be one of the inputs"
+done
+[ "$force" -eq 1 ] || [ ! -e "$output" ] || die "$output already exists (use --force to overwrite)"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/ffconcat.XXXXXX")
+partial=$(dirname -- "$output")/.$(basename -- "$output").partial.$$.${output##*.}
+trap 'rm -rf "$work"; rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+stats=-nostats
+[ -t 2 ] && stats=-stats
+ff() { ffmpeg -hide_banner -nostdin -loglevel error "$stats" "$@"; }
+
+if [ "$reencode" -eq 0 ]; then
+  want=$(signature "$first")
+  for input in "${inputs[@]}"; do
+    got=$(signature "$input")
+    if [ "$got" != "$want" ]; then
+      printf '%s: these files can'\''t be joined without re-encoding:\n  %s: %s\n  %s: %s\n' \
+        "$PROG" "$first" "$want" "$input" "$got" >&2
+      die "run again with --reencode to convert them to a common format"
+    fi
+  done
+
+  # The concat demuxer reads a list of files; quote each path for it, with
+  # any ' written as '\''. Absolute paths, since the list lives elsewhere.
+  for input in "${inputs[@]}"; do
+    abs=$(cd "$(dirname -- "$input")" && pwd)/$(basename -- "$input")
+    printf "file '%s'\n" "$(printf '%s' "$abs" | sed "s/'/'\\\\''/g")"
+  done >"$work/list.txt"
+
+  ff -f concat -safe 0 -i "$work/list.txt" -map '0:v?' -map '0:a?' -c copy -y "$partial" ||
+    die "ffmpeg couldn't join the files"
+else
+  # Work out the target picture from the first file that has video.
+  width='' height='' fps=''
+  with_video=0 with_audio=0
+  for input in "${inputs[@]}"; do
+    v=$(probe "$input" v) a=$(probe "$input" a)
+    if [ -n "$v" ]; then
+      with_video=$((with_video + 1))
+      if [ -z "$width" ]; then
+        width=$(field "$v" width) height=$(field "$v" height) fps=$(field "$v" avg_frame_rate)
+      fi
+    fi
+    [ -z "$a" ] || with_audio=$((with_audio + 1))
+  done
+  count=${#inputs[@]}
+  if [ "$with_video" -ne 0 ] && [ "$with_video" -ne "$count" ]; then
+    die "some files have video and some don't; join only videos, or only audio"
+  fi
+  case $fps in ''|0/0|*/0) fps=30 ;; esac
+  # yuv420p needs even dimensions.
+  [ -z "$width" ] || { width=$((width / 2 * 2)); height=$((height / 2 * 2)); }
+
+  # Build one concat filter: every video scaled and padded to the same size
+  # and frame rate, every audio track resampled to 48 kHz stereo. A video
+  # without sound gets matching silence so the tracks stay in step.
+  set --
+  filter='' joined='' extra=$count i=0
+  for input in "${inputs[@]}"; do
+    case $input in -*) input=./$input ;; esac
+    set -- "$@" -i "$input"
+  done
+  for input in "${inputs[@]}"; do
+    if [ "$with_video" -gt 0 ]; then
+      filter="${filter}[$i:v:0]scale=$width:$height:force_original_aspect_ratio=decrease,pad=$width:$height:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=$fps,format=yuv420p[v$i];"
+      joined="${joined}[v$i]"
+    fi
+    if [ "$with_audio" -gt 0 ]; then
+      if [ -n "$(probe "$input" a)" ]; then
+        src="$i:a:0"
+      else
+        length=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 -- "$input")
+        set -- "$@" -f lavfi -t "$length" -i anullsrc=r=48000:cl=stereo
+        src="$extra:a"
+        extra=$((extra + 1))
+      fi
+      filter="${filter}[$src]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a$i];"
+      joined="${joined}[a$i]"
+    fi
+    i=$((i + 1))
+  done
+  v_out=0 a_out=0 maps=()
+  if [ "$with_video" -gt 0 ]; then v_out=1; maps+=(-map '[v]' -c:v libx264 -crf 20 -preset medium); fi
+  if [ "$with_audio" -gt 0 ]; then a_out=1; maps+=(-map '[a]' -c:a aac -b:a 192k); fi
+  outs=''
+  [ "$v_out" -eq 0 ] || outs='[v]'
+  [ "$a_out" -eq 0 ] || outs="${outs}[a]"
+  filter="$filter${joined}concat=n=$count:v=$v_out:a=$a_out$outs"
+
+  case $output in *.mp4|*.MP4|*.m4v|*.mov|*.m4a) maps+=(-movflags +faststart) ;; esac
+  ff "$@" -filter_complex "$filter" ${maps[@]+"${maps[@]}"} -y "$partial" ||
+    die "ffmpeg couldn't join the files"
+fi
+
+mv -f "$partial" "$output"
+echo "Joined ${#inputs[@]} files -> $output"
