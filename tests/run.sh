@@ -357,17 +357,24 @@ test_wait_for_rejects_bad_target() {
 test_wait_for_http_url() {
   have curl || have wget || skip "no curl or wget"
   have python3 || skip "python3 not installed"
-  mkdir site && echo ok >site/health
-  # The test server binds port 0, so the OS picks a port that's really free,
-  # and prints it once it's listening (a port from free_port proved
-  # unreachable on GitHub's macOS runners).
-  (cd site && exec python3 -c '
-import http.server, sys
-class Quiet(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, *args): pass
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
-print(server.server_address[1], flush=True)
-server.serve_forever()' >../port.txt 2>../server.log) &
+  # A minimal HTTP responder on a plain socket: /health answers 200 and
+  # anything else 404. It binds port 0 so the OS picks a free port, and
+  # prints it once listening. (Test servers built on Python's http.server
+  # never came up in this test on GitHub's macOS runners, while plain-socket
+  # listeners like start_listener's work there.)
+  python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(16)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept()
+    request = c.recv(65536).split(b" ")
+    path = request[1] if len(request) > 1 else b"/"
+    if path == b"/health":
+        c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    else:
+        c.sendall(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    c.close()' >port.txt 2>server.log &
   srv=$!
   i=0
   while [ ! -s port.txt ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
