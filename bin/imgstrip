@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+#
+# imgstrip: remove hidden metadata (GPS location, camera details) from images.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] IMAGE...
+
+Remove the hidden metadata from images before you share them: EXIF
+(including the GPS location where a photo was taken, the camera model and
+serial number, and the date), XMP, IPTC, comments and text notes. Each
+IMAGE is saved as NAME.clean.EXT next to the original, unless you pass
+--in-place.
+
+JPEG and PNG files are cleaned without re-encoding, so the picture is
+exactly the same, bit for bit. A photo's orientation is kept (in a tiny
+EXIF block holding nothing else) so it doesn't end up sideways. Colour
+profiles are kept too. This part needs python3.
+
+Other formats (WebP, TIFF, GIF ...) are re-encoded by ImageMagick with
+the metadata left out; they're turned upright first.
+
+Options:
+  -i, --in-place     replace each original with the cleaned file
+  -o, --output FILE  where to write (only with a single IMAGE)
+  -f, --force        overwrite output files that already exist
+  -h, --help         show this help
+
+Examples:
+  $PROG IMG_2041.jpg              # IMG_2041.clean.jpg
+  $PROG -i screenshots/*.png      # clean the files themselves
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+in_place=0 output='' force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -i|--in-place) in_place=1 ;;
+    -o|--output)   [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)    force=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; inputs+=("$@"); break ;;
+    -*)            usage_error "unknown option: $1" ;;
+    *)             inputs+=("$1") ;;
+  esac
+  shift
+done
+[ ${#inputs[@]} -gt 0 ] || usage_error "give at least one image"
+[ -z "$output" ] || [ ${#inputs[@]} -eq 1 ] || usage_error "--output only works with a single image"
+[ -z "$output" ] || [ "$in_place" -eq 0 ] || usage_error "use either --output or --in-place, not both"
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# How a file will be cleaned: "lossless" (JPEG/PNG with python3) or "magick".
+method_for() {
+  case $(lower "${1##*.}") in
+    jpg|jpeg|jpe|png) if have python3; then echo lossless; else echo magick; fi ;;
+    *)                echo magick ;;
+  esac
+}
+
+# Work out every output first, so nothing is written if any would fail.
+outputs=() need_magick=0
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+  if [ "$in_place" -eq 1 ]; then
+    # Replacing a symlink would leave the real photo, metadata and all,
+    # untouched; better to say so.
+    [ ! -L "$input" ] || die "$input is a symlink; run $PROG on the file it points to"
+    out=$input
+  elif [ -n "$output" ]; then
+    out=$output
+  else
+    dir=$(dirname -- "$input") base=$(basename -- "$input") ext=''
+    case $base in ?*.*) ext=.${base##*.}; base=${base%.*} ;; esac
+    [ -n "$ext" ] || die "$input has no file extension, so its format is unclear"
+    out=$base.clean$ext
+    [ "$dir" = . ] || out=$dir/$out
+  fi
+  case $out in -*) out=./$out ;; esac
+  if [ "$in_place" -eq 0 ] && [ -e "$out" ]; then
+    [ ! "$out" -ef "$input" ] || die "the output can't be the input file (use --in-place for that)"
+    [ "$force" -eq 1 ] || die "$out already exists (use --force to overwrite)"
+  fi
+  if [ "$(method_for "$input")" = lossless ]; then
+    [ "$(lower "${out##*.}")" = "$(lower "${input##*.}")" ] ||
+      [ "$(method_for "$out")" = lossless ] || die "$out: keep the same file type as $input"
+  else
+    need_magick=1
+  fi
+  outputs+=("$out")
+done
+
+IM=()
+if [ "$need_magick" -eq 1 ]; then
+  # ImageMagick 7 is one "magick" command; version 6 has "convert".
+  if have magick; then
+    IM=(magick)
+  elif have convert; then
+    IM=(convert)
+  else
+    die "needs ImageMagick for files other than JPEG and PNG (macOS: brew install imagemagick; Debian/Ubuntu: sudo apt install imagemagick)"
+  fi
+fi
+
+# Lossless cleaner for JPEG and PNG: copies the file block by block and
+# leaves out the metadata blocks. Prints what it removed.
+clean_losslessly() {
+  python3 - "$PROG" "$1" "$2" <<'PY'
+import struct, sys
+
+prog, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+data = open(src, "rb").read()
+
+def fail(message):
+    sys.exit("%s: %s: %s" % (prog, src, message))
+
+def exif_details(tiff):
+    """(orientation, has_gps) from the first IFD of an EXIF block."""
+    try:
+        bo = {b"II": "<", b"MM": ">"}[tiff[:2]]
+        ifd = struct.unpack(bo + "I", tiff[4:8])[0]
+        count = struct.unpack(bo + "H", tiff[ifd:ifd + 2])[0]
+        orientation, gps = 1, False
+        for k in range(count):
+            e = ifd + 2 + 12 * k
+            tag, typ = struct.unpack(bo + "HH", tiff[e:e + 4])
+            if tag == 0x0112 and typ == 3:
+                orientation = struct.unpack(bo + "H", tiff[e + 8:e + 10])[0]
+            elif tag == 0x8825:
+                gps = True
+        return (orientation if 1 <= orientation <= 8 else 1), gps
+    except (KeyError, struct.error, IndexError):
+        return 1, False
+
+def segment(marker, payload):
+    return b"\xff" + bytes([marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+def clean_jpeg():
+    if data[:2] != b"\xff\xd8":
+        fail("not a JPEG file")
+    head, removed, orientation = [], [], 1
+    body = bytearray()
+    in_header = True
+    i, n = 2, len(data)
+    while True:
+        if i + 1 >= n or data[i] != 0xFF:
+            fail("the JPEG data is damaged or cut short")
+        while data[i + 1] == 0xFF:                 # padding before a marker
+            i += 1
+        m = data[i + 1]
+        if m == 0xD9:                              # end of image: drop anything after it
+            body += b"\xff\xd9"
+            break
+        if m == 0x01 or 0xD0 <= m <= 0xD7:         # markers without a length
+            if in_header:
+                head.append(data[i:i + 2])
+            else:
+                body += data[i:i + 2]
+            i += 2
+            continue
+        length = struct.unpack(">H", data[i + 2:i + 4])[0]
+        seg, payload = data[i:i + 2 + length], data[i + 4:i + 2 + length]
+        i += 2 + length
+        keep = True
+        if m == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+            orientation, gps = exif_details(payload[6:])
+            removed.append("EXIF (with GPS location)" if gps else "EXIF")
+            keep = False
+        elif m == 0xE1:
+            removed.append("XMP" if b"xap" in payload[:40] or b"xmp" in payload[:40].lower() else "APP1 data")
+            keep = False
+        elif m == 0xFE:
+            removed.append("comment")
+            keep = False
+        elif m == 0xED:
+            removed.append("IPTC/Photoshop data")
+            keep = False
+        elif m == 0xE2 and not payload.startswith(b"ICC_PROFILE\x00"):
+            removed.append("APP2 data")                # e.g. FlashPix; the ICC profile stays
+            keep = False
+        elif 0xE3 <= m <= 0xEF and m != 0xEE:          # maker data; APP14 (Adobe) stays
+            removed.append("APP%d data" % (m - 0xE0))
+            keep = False
+        if keep:
+            if in_header:
+                head.append(seg)
+            else:
+                body += seg
+        if m == 0xDA:                                  # start of scan: copy the image data
+            in_header = False
+            j = i
+            while True:
+                j = data.find(b"\xff", j)
+                if j < 0 or j + 1 >= n:
+                    fail("the JPEG data is damaged or cut short")
+                if data[j + 1] == 0x00 or 0xD0 <= data[j + 1] <= 0xD7:
+                    j += 2                             # stuffed byte or restart marker
+                elif data[j + 1] == 0xFF:
+                    j += 1
+                else:
+                    break
+            body += data[i:j]
+            i = j
+    # Keep the orientation, alone in a minimal EXIF block, so photos taken
+    # sideways still display upright. It goes after JFIF (APP0) if there is one.
+    if orientation != 1:
+        tiff = (b"MM\x00\x2a" + struct.pack(">IH", 8, 1)
+                + struct.pack(">HHIHH", 0x0112, 3, 1, orientation, 0) + struct.pack(">I", 0))
+        at = 1 if head and head[0][1] == 0xE0 else 0
+        head.insert(at, segment(0xE1, b"Exif\x00\x00" + tiff))
+    return b"\xff\xd8" + b"".join(head) + bytes(body), removed, orientation != 1
+
+def clean_png():
+    sig = b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(sig):
+        fail("not a PNG file")
+    out, removed, i = [sig], [], 8
+    while i + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[i:i + 8])
+        chunk = data[i:i + 12 + length]
+        i += 12 + length
+        if kind in (b"tEXt", b"zTXt", b"iTXt"):
+            key = chunk[8:8 + 80].split(b"\x00")[0].decode("latin-1")
+            removed.append("EXIF" if "exif" in key.lower() else "text (%s)" % key)
+        elif kind == b"eXIf":
+            removed.append("EXIF")
+        elif kind == b"tIME":
+            removed.append("timestamp")
+        else:
+            out.append(chunk)
+        if kind == b"IEND":
+            break
+    return b"".join(out), removed, False
+
+if data[:2] == b"\xff\xd8":
+    result, removed, kept_orientation = clean_jpeg()
+elif data[:8] == b"\x89PNG\r\n\x1a\n":
+    result, removed, kept_orientation = clean_png()
+else:
+    fail("not a JPEG or PNG file, whatever its name says")
+
+with open(dst, "wb") as f:
+    f.write(result)
+
+# Summarise: "EXIF (with GPS location), XMP, 2 x text (...)".
+seen = []
+for r in removed:
+    if r not in seen:
+        seen.append(r)
+parts = [("%d x %s" % (removed.count(r), r)) if removed.count(r) > 1 else r for r in seen]
+summary = "removed " + ", ".join(parts) if parts else "no metadata found"
+if kept_orientation:
+    summary += "; kept the orientation"
+print(summary)
+PY
+}
+
+# Give the new file the original's permissions, so --in-place doesn't
+# quietly make a private file readable by everyone (GNU stat, then BSD).
+keep_mode() {
+  local mode
+  mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null) || return 0
+  chmod "$mode" "$2" 2>/dev/null || true
+}
+
+partial=''
+trap '[ -z "$partial" ] || rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+status=0
+i=0
+for input in "${inputs[@]}"; do
+  out=${outputs[$i]}
+  i=$((i + 1))
+  case $input in -*) input=./$input ;; esac
+  partial=$(dirname -- "$out")/.$(basename -- "$out").partial.$$.${out##*.}
+
+  if [ "$(method_for "$input")" = lossless ]; then
+    # The cleaner explains any failure itself.
+    if summary=$(clean_losslessly "$input" "$partial") && [ -s "$partial" ]; then
+      [ "$in_place" -eq 0 ] || keep_mode "$input" "$partial"
+      mv -f "$partial" "$out"
+      echo "$input -> $out ($summary)"
+    else
+      rm -f "$partial"
+      status=1
+    fi
+  else
+    ext=$(lower "${out##*.}")
+    case $ext in
+      jpg|jpeg|jpe) format=JPEG ;;
+      tif|tiff)     format=TIFF ;;
+      *)            format=$(printf '%s' "$ext" | tr '[:lower:]' '[:upper:]') ;;
+    esac
+    # Keep only the colour profile; drop the comment and PNG text chunks.
+    set -- "$input" -auto-orient +profile '!icc,*' +set comment
+    case $format in
+      PNG)  set -- "$@" -define png:exclude-chunks=date,tIME,zTXt,tEXt,iTXt,eXIf ;;
+      WEBP) set -- "$@" -quality 92 ;;
+    esac
+    if "${IM[@]}" "$@" "$format:$partial" && [ -s "$partial" ]; then
+      [ "$in_place" -eq 0 ] || keep_mode "$input" "$partial"
+      mv -f "$partial" "$out"
+      echo "$input -> $out (re-encoded without metadata)"
+    else
+      rm -f "$partial"
+      printf '%s: failed to clean %s (can ImageMagick write .%s files?)\n' "$PROG" "$input" "$ext" >&2
+      status=1
+    fi
+  fi
+  partial=''
+done
+exit "$status"

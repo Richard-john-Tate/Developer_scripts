@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# imgconvert: convert images between formats.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG -t FORMAT [options] IMAGE...
+
+Convert each IMAGE to FORMAT, saved as NAME.FORMAT next to the original.
+Photos are turned upright first (using their EXIF orientation).
+
+FORMAT is one of: jpg, png, webp, gif, tiff, avif (avif only if your
+ImageMagick can write it). Inputs can be anything ImageMagick reads,
+including iPhone HEIC photos and AVIF when it was built with libheif.
+
+Converting to JPEG puts transparent areas on white, as JPEG has no
+transparency. JPEG and PNG hold a single picture, so an animated GIF
+converts to its first frame.
+
+Options:
+  -t, --to FORMAT    the format to convert to (required)
+  -q, --quality N    quality for jpg, webp and avif, 1-100 (default:
+                     ImageMagick's, about 92 for JPEG)
+  -o, --output FILE  where to write (only with a single IMAGE)
+  -f, --force        overwrite output files that already exist
+  -h, --help         show this help
+
+Examples:
+  $PROG -t jpg IMG_0042.HEIC
+  $PROG -t webp -q 80 images/*.png
+  $PROG -t png -o logo.png logo.webp
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+to='' quality='' output='' force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -t|--to)      [ $# -ge 2 ] || usage_error "$1 needs a value"; to=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]'); shift ;;
+    -q|--quality) [ $# -ge 2 ] || usage_error "$1 needs a value"; quality=$2; shift ;;
+    -o|--output)  [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)   force=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; inputs+=("$@"); break ;;
+    -*)           usage_error "unknown option: $1" ;;
+    *)            inputs+=("$1") ;;
+  esac
+  shift
+done
+[ -n "$to" ] || usage_error "say which format to convert to with --to (jpg, png, webp, gif, tiff, avif)"
+[ ${#inputs[@]} -gt 0 ] || usage_error "give at least one image"
+[ -z "$output" ] || [ ${#inputs[@]} -eq 1 ] || usage_error "--output only works with a single image"
+case $to in
+  jpg|jpeg) ext=jpg format=JPEG ;;
+  png)      ext=png format=PNG ;;
+  webp)     ext=webp format=WEBP ;;
+  gif)      ext=gif format=GIF ;;
+  tif|tiff) ext=tiff format=TIFF ;;
+  avif)     ext=avif format=AVIF ;;
+  *)        usage_error "unknown format '$to' (use jpg, png, webp, gif, tiff or avif)" ;;
+esac
+if [ -n "$quality" ]; then
+  case $quality in *[!0-9]*|0) usage_error "--quality must be a number from 1 to 100" ;; esac
+  [ "$quality" -le 100 ] || usage_error "--quality must be a number from 1 to 100"
+  case $format in JPEG|WEBP|AVIF) ;; *) usage_error "--quality only applies to jpg, webp and avif" ;; esac
+fi
+
+# ImageMagick 7 is one "magick" command; version 6 has "convert".
+if have magick; then
+  IM=(magick)
+elif have convert; then
+  IM=(convert)
+else
+  die "needs ImageMagick (macOS: brew install imagemagick; Debian/Ubuntu: sudo apt install imagemagick)"
+fi
+
+# What this ImageMagick can do with a format: "rw+" for JPEG, "r--" for a
+# read-only one, nothing if it doesn't know it.
+FORMATS=$("${IM[@]}" -list format 2>/dev/null || true)
+format_mode() {
+  printf '%s\n' "$FORMATS" | awk -v want="$1" '
+    { name = toupper($1); sub(/\*$/, "", name) }
+    name == want && mode == "" { for (i = 2; i <= NF; i++) if ($i ~ /^[r-][w-][+-]$/) { mode = $i; break } }
+    END { print mode }'
+}
+case $(format_mode "$format") in
+  ?w?) ;;
+  *)   die "this ImageMagick can't write $to files (it needs to be built with support for them)" ;;
+esac
+
+# Work out every output first, so nothing is written if any would fail.
+outputs=()
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+  if [ -n "$output" ]; then
+    out=$output
+  else
+    dir=$(dirname -- "$input") base=$(basename -- "$input")
+    case $base in ?*.*) base=${base%.*} ;; esac
+    out=$base.$ext
+    [ "$dir" = . ] || out=$dir/$out
+  fi
+  case $out in -*) out=./$out ;; esac
+  if [ -e "$out" ]; then
+    [ ! "$out" -ef "$input" ] || die "$input is already a .$ext file"
+    [ "$force" -eq 1 ] || die "$out already exists (use --force to overwrite)"
+  fi
+  outputs+=("$out")
+done
+
+# Settings for the target format.
+case $format in
+  JPEG) extra=(-background white -alpha remove -alpha off) ;;   # no transparency in JPEG
+  GIF)  extra=(-layers Optimize) ;;
+  *)    extra=() ;;
+esac
+[ -z "$quality" ] || extra+=(-quality "$quality")
+
+partial=''
+trap '[ -z "$partial" ] || rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+status=0
+i=0
+for input in "${inputs[@]}"; do
+  out=${outputs[$i]}
+  i=$((i + 1))
+  case $input in -*) input=./$input ;; esac
+  # Single-picture formats take the first frame of an animation or a
+  # multi-page file; ImageMagick would otherwise write name-0, name-1, ...
+  case $format in
+    GIF)       src=("$input" -coalesce) ;;
+    TIFF|WEBP) src=("$input") ;;
+    *)         src=("${input}[0]") ;;
+  esac
+
+  partial=$(dirname -- "$out")/.$(basename -- "$out").partial.$$.$ext
+  if "${IM[@]}" "${src[@]}" -auto-orient ${extra[@]+"${extra[@]}"} "$format:$partial" && [ -s "$partial" ]; then
+    mv -f "$partial" "$out"
+    echo "$input -> $out"
+  else
+    rm -f "$partial"
+    printf '%s: failed to convert %s\n' "$PROG" "$input" >&2
+    status=1
+  fi
+  partial=''
+done
+exit "$status"

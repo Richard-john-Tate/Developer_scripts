@@ -77,6 +77,16 @@ leaves a half-written file behind.
 | [`ffthumbs`](bin/ffthumbs) | A thumbnail, N evenly spaced frames, or a contact sheet (`-s 4x4`) of a whole video. |
 | [`ffconcat`](bin/ffconcat) | Join clips end to end, losslessly when they match, or with `-r` for any mix of sizes and formats. |
 
+### Images (ImageMagick)
+
+| Command | What it does |
+| --- | --- |
+| [`imgresize`](bin/imgresize) | Resize by width, height, longest side (`-m 1920`) or percent. Never enlarges, turns photos upright, keeps GIFs animated. |
+| [`imgconvert`](bin/imgconvert) | Convert to jpg, png, webp, gif or tiff (avif if your ImageMagick can write it). Reads iPhone HEIC; transparency goes on white for JPEG. |
+| [`imgshrink`](bin/imgshrink) | Optimise images for the web: turn photos upright, cap the longest side at 2048 px, remove EXIF (including GPS location) and recompress. |
+| [`imgstrip`](bin/imgstrip) | Remove hidden metadata (GPS location, camera serial number, XMP, comments) before sharing. JPEG and PNG are cleaned without re-encoding, so the picture is bit-for-bit the same. |
+| [`favicon`](bin/favicon) | Make favicon.ico, favicon-32x32.png, apple-touch-icon.png and 192/512 app icons from one image, and print the HTML to paste. |
+
 ### Docker
 
 All four also work with podman (or any docker-compatible tool): set
@@ -158,6 +168,12 @@ ffaudio -t mp3 lecture.mp4
 ffthumbs -s 4x4 lecture.mp4      # contact sheet of the whole video
 ffconcat part1.mp4 part2.mp4 part3.mp4
 
+# Images
+imgshrink -m 1200 photos/*.jpg   # web-ready copies, location data removed
+imgconvert -t jpg IMG_0042.HEIC
+imgstrip -i IMG_2041.jpg         # remove GPS etc. from the file itself
+favicon -d public logo.png
+
 # Docker
 dps                              # what's running, on which ports?
 dshell db -- psql -U postgres    # run psql in the container whose name has "db"
@@ -199,6 +215,8 @@ if it's there:
 | `extract` | `unzip`, `zstd`, `7z` or `unrar` for those formats |
 | `todos` | `rg` (ripgrep), if installed, for speed and `.gitignore` support |
 | `ff*` | `ffmpeg` and `ffprobe` (macOS: `brew install ffmpeg`; Debian/Ubuntu: `sudo apt install ffmpeg`) |
+| `img*`, `favicon` | ImageMagick 6 or 7 (macOS: `brew install imagemagick`; Debian/Ubuntu: `sudo apt install imagemagick`). `imgstrip` cleans JPEG and PNG with `python3` |
+| `dps`, `dshell`, `dlogs`, `docker-clean` | `docker`, or podman with `DOCKER=podman` |
 
 ## Development
 
@@ -209,8 +227,9 @@ make check    # both
 ```
 
 The tests need only bash, git and the usual system tools. Tests that need
-an optional tool, such as `python3`, `zip` or `ffmpeg`, are skipped if it's
-missing.
+an optional tool, such as `python3`, `zip`, `ffmpeg` or ImageMagick, are
+skipped if it's missing. The Docker tests use a stand-in `docker` command,
+so they need no Docker daemon.
 Pass a name to run a subset: `tests/run.sh killport`.
 
 To add a script, start it with `bin/mkscript bin/my-tool "What it does"`

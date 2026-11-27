@@ -24,12 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg and ImageMagick
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg imagemagick
           else
             command -v ffmpeg || brew install ffmpeg
+            command -v magick || brew install imagemagick
           fi
 
       # macOS ships bash 3.2 as /bin/bash, but the runner puts a newer

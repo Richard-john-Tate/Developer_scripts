@@ -1503,6 +1503,241 @@ test_docker_scripts_use_podman_when_asked() {
   expect_out "ran: podman exec -i shop-db-1 true"
 }
 
+# Tests for the image scripts (imgresize, imgconvert, imgshrink, imgstrip,
+# favicon). Meant to be merged into tests/run.sh, which provides run,
+# expect_*, fail, skip and have, and sets $out and $status.
+# shellcheck disable=SC2154  # out and status are set by run() in tests/run.sh
+
+# --- images -----------------------------------------------------------------
+
+need_imagemagick() { { have magick || { have convert && have identify; }; } || skip "ImageMagick not installed"; }
+im() { if have magick; then magick "$@"; else convert "$@"; fi; }
+im_identify() { if have magick; then magick identify "$@"; else identify "$@"; fi; }
+img_size() { im_identify -format '%wx%h' "${1}[0]"; }
+img_pixels() { im_identify -format '%#' "${1}[0]"; }        # a hash of the pixels
+img_frames() { im_identify -format '%n\n' "$1" | head -n 1; }
+img_metadata() { im_identify -verbose "$1" 2>/dev/null; }
+img_no_partials() { [ -z "$(find . -name '*.partial.*')" ] || fail "a .partial file was left behind"; }
+
+# make_photo FILE ORIENTATION: an 800x600 JPEG carrying EXIF (orientation,
+# GPS position, camera serial number), XMP and a comment, like a phone photo.
+make_photo() {
+  have python3 || skip "python3 not installed"
+  im -size 800x600 gradient:red-blue "$1.plain.jpg"
+  python3 - "$1.plain.jpg" "$1" "$2" <<'PY'
+import struct, sys
+src, dst, orientation = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(src, "rb").read()
+def entry(tag, typ, count, value):
+    return struct.pack(">HHI", tag, typ, count) + value
+gps_off = 8 + 2 + 12 * 3 + 4
+data_off = gps_off + 2 + 12 * 4 + 4
+serial = b"SN-123456789\x00"
+lat = struct.pack(">IIIIII", 51, 1, 30, 1, 0, 1)
+lon = struct.pack(">IIIIII", 0, 1, 7, 1, 0, 1)
+ifd0 = (struct.pack(">H", 3)
+        + entry(0x0112, 3, 1, struct.pack(">HH", orientation, 0))
+        + entry(0x8825, 4, 1, struct.pack(">I", gps_off))
+        + entry(0xA431, 2, len(serial), struct.pack(">I", data_off))
+        + struct.pack(">I", 0))
+gps = (struct.pack(">H", 4)
+       + entry(1, 2, 2, b"N\x00\x00\x00")
+       + entry(2, 5, 3, struct.pack(">I", data_off + len(serial)))
+       + entry(3, 2, 2, b"W\x00\x00\x00")
+       + entry(4, 5, 3, struct.pack(">I", data_off + len(serial) + len(lat)))
+       + struct.pack(">I", 0))
+tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + ifd0 + gps + serial + lat + lon
+seg = lambda m, p: b"\xff" + bytes([m]) + struct.pack(">H", len(p) + 2) + p
+xmp = b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta photoshop:City=\"Secretville\"/>"
+open(dst, "wb").write(data[:2] + seg(0xE1, b"Exif\x00\x00" + tiff) + seg(0xE1, xmp)
+                      + seg(0xFE, b"private comment") + data[2:])
+PY
+  rm -f "$1.plain.jpg"
+}
+
+test_imgresize_shrinks_but_never_enlarges() {
+  need_imagemagick
+  im -size 800x600 gradient:red-blue a.jpg
+  im -size 300x200 xc:white b.png
+  im -delay 10 -size 400x400 xc:red xc:green xc:blue anim.gif
+  run imgresize -m 400 a.jpg
+  expect_status 0
+  [ "$(img_size a.resized.jpg)" = 400x300 ] || fail "-m 400 gave $(img_size a.resized.jpg)"
+  run imgresize -w 2000 -o big.jpg a.jpg
+  expect_status 0
+  [ "$(img_size big.jpg)" = 800x600 ] || fail "the image was enlarged"
+  run imgresize --height 150 b.png
+  [ "$(img_size b.resized.png)" = 225x150 ] || fail "--height 150 gave $(img_size b.resized.png)"
+  run imgresize -p 50 anim.gif
+  expect_status 0
+  [ "$(img_frames anim.resized.gif)" = 3 ] || fail "the animation lost frames"
+  [ "$(img_size anim.resized.gif)" = 200x200 ] || fail "-p 50 gave $(img_size anim.resized.gif)"
+
+  run imgresize -m 400 a.jpg
+  expect_status 1
+  expect_out "already exists"
+  run imgresize -p 150 a.jpg
+  expect_status 2
+  run imgresize a.jpg
+  expect_status 2
+  img_no_partials
+}
+
+test_imgresize_turns_photos_upright() {
+  need_imagemagick
+  make_photo sideways.jpg 6
+  run imgresize -m 400 sideways.jpg
+  expect_status 0
+  [ "$(img_size sideways.resized.jpg)" = 300x400 ] || fail "not turned upright: $(img_size sideways.resized.jpg)"
+}
+
+test_imgconvert_formats() {
+  need_imagemagick
+  im -size 200x100 xc:none -fill red -draw 'circle 100,50 100,10' logo.png
+  im -delay 10 -size 100x100 xc:red xc:green anim.gif
+  run imgconvert -t jpg logo.png anim.gif
+  expect_status 0
+  [ "$(im logo.jpg -format '%[pixel:p{0,0}]' info:)" = "srgb(255,255,255)" ] ||
+    fail "transparency wasn't put on white"
+  expect_file anim.jpg
+  expect_no_file anim-0.jpg
+  run imgconvert -t webp -q 70 logo.png
+  expect_status 0
+  [ "$(im_identify -format '%m' logo.webp)" = WEBP ] || fail "logo.webp isn't WebP"
+
+  run imgconvert -t png logo.png
+  expect_status 1
+  expect_out "already a .png"
+  run imgconvert -t png -q 50 logo.webp
+  expect_status 2
+  run imgconvert -t bmp logo.png
+  expect_status 2
+  run imgconvert logo.png
+  expect_status 2
+  img_no_partials
+}
+
+test_imgshrink_removes_location_and_turns_upright() {
+  need_imagemagick
+  make_photo photo.jpg 6
+  run imgshrink photo.jpg
+  expect_status 0
+  expect_out "% of the original"
+  [ "$(img_size photo.small.jpg)" = 600x800 ] || fail "not turned upright: $(img_size photo.small.jpg)"
+  case $(img_metadata photo.small.jpg) in
+    *GPS*|*SN-123456789*|*Secretville*|*"private comment"*) fail "metadata survived imgshrink" ;;
+  esac
+  [ "$(im_identify -format '%Q' photo.small.jpg)" = 82 ] || fail "JPEG quality isn't 82"
+
+  run imgshrink --keep-metadata -o kept.jpg photo.jpg
+  expect_status 0
+  case $(img_metadata kept.jpg) in *GPS*) ;; *) fail "--keep-metadata dropped the EXIF" ;; esac
+  img_no_partials
+}
+
+test_imgshrink_limits_size() {
+  need_imagemagick
+  im -size 3000x1000 gradient:white-black wide.png
+  run imgshrink wide.png
+  expect_status 0
+  [ "$(img_size wide.small.png)" = 2048x683 ] || fail "not limited to 2048: $(img_size wide.small.png)"
+  run imgshrink -m 0 -o same.png wide.png
+  [ "$(img_size same.png)" = 3000x1000 ] || fail "-m 0 resized the image"
+  run imgshrink -m 400 -q 0 wide.png
+  expect_status 2
+}
+
+test_imgstrip_is_lossless_and_keeps_orientation() {
+  need_imagemagick
+  make_photo photo.jpg 6
+  run imgstrip photo.jpg
+  expect_status 0
+  expect_out "EXIF (with GPS location)"
+  expect_out "kept the orientation"
+  [ "$(img_pixels photo.jpg)" = "$(img_pixels photo.clean.jpg)" ] || fail "the picture itself changed"
+  case $(img_metadata photo.clean.jpg) in
+    *GPS*|*SN-123456789*|*Secretville*|*"private comment"*) fail "metadata survived imgstrip" ;;
+  esac
+  [ "$(im_identify -format '%[EXIF:Orientation]' photo.clean.jpg)" = 6 ] || fail "the orientation was lost"
+
+  im -size 200x100 xc:none -fill red -draw 'circle 100,50 100,10' -set comment "secret note" shot.png
+  run imgstrip shot.png
+  expect_status 0
+  [ "$(img_pixels shot.png)" = "$(img_pixels shot.clean.png)" ] || fail "the PNG picture changed"
+  case $(img_metadata shot.clean.png) in *"secret note"*) fail "PNG comment survived" ;; esac
+
+  cp photo.jpg inplace.jpg
+  run imgstrip -i inplace.jpg
+  expect_status 0
+  cmp -s inplace.jpg photo.clean.jpg || fail "--in-place result differs from the normal one"
+
+  run imgstrip photo.jpg
+  expect_status 1
+  expect_out "already exists"
+}
+
+test_imgstrip_damaged_and_other_formats() {
+  need_imagemagick
+  make_photo photo.jpg 1
+  head -c 3000 photo.jpg >cut.jpg
+  run imgstrip cut.jpg
+  expect_status 1
+  expect_out "damaged or cut short"
+  expect_no_file cut.clean.jpg
+  img_no_partials
+
+  im -size 100x100 xc:blue -set comment "hidden" pic.webp
+  run imgstrip pic.webp
+  expect_status 0
+  expect_out "re-encoded"
+  case $(img_metadata pic.clean.webp) in *hidden*) fail "WebP comment survived" ;; esac
+}
+
+test_favicon_makes_every_icon() {
+  need_imagemagick
+  im -size 800x400 xc:none -fill '#3366cc' -draw 'roundrectangle 0,0 799,399 40,40' logo.png
+  run favicon -d site logo.png
+  expect_status 0
+  expect_out '<link rel="apple-touch-icon"'
+  [ "$(im_identify -format '%wx%h ' site/favicon.ico)" = "48x48 32x32 16x16 " ] ||
+    fail "favicon.ico sizes: $(im_identify -format '%wx%h ' site/favicon.ico)"
+  [ "$(img_size site/favicon-32x32.png)" = 32x32 ] || fail "favicon-32x32.png size"
+  [ "$(img_size site/apple-touch-icon.png)" = 180x180 ] || fail "apple-touch-icon.png size"
+  [ "$(img_size site/icon-192.png)" = 192x192 ] || fail "icon-192.png size"
+  [ "$(img_size site/icon-512.png)" = 512x512 ] || fail "icon-512.png size"
+  # A wide logo is centred on a transparent square, not stretched.
+  [ "$(im site/icon-512.png -format '%[pixel:p{0,0}]' info:)" = "srgba(0,0,0,0)" ] ||
+    fail "icon-512.png isn't padded with transparency"
+  [ "$(im_identify -format '%A' site/apple-touch-icon.png)" = False ] ||
+    fail "apple-touch-icon.png should have no transparency"
+
+  run favicon -d site logo.png
+  expect_status 1
+  expect_out "already exists"
+
+  im -size 100x100 xc:red small.png
+  run favicon -d small small.png
+  expect_status 0
+  expect_out "will be blurry"
+  img_no_partials
+}
+
+test_imgstrip_in_place_keeps_permissions_and_refuses_symlinks() {
+  need_imagemagick
+  make_photo private.jpg 1
+  chmod 600 private.jpg
+  run imgstrip -i private.jpg
+  expect_status 0
+  case $(ls -l private.jpg) in -rw-------*) ;; *) fail "--in-place changed the permissions: $(ls -l private.jpg)" ;; esac
+  make_photo real.jpg 1
+  ln -s real.jpg link.jpg
+  run imgstrip -i link.jpg
+  expect_status 1
+  expect_out "is a symlink"
+  [ -L link.jpg ] || fail "the symlink was replaced"
+  case $(img_metadata real.jpg) in *GPS*) ;; *) fail "the linked photo was changed" ;; esac
+}
+
 # --- runner -----------------------------------------------------------------
 
 filter=${1:-}
