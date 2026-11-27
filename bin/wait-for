@@ -76,11 +76,16 @@ tcp_open() {
   wait "$pid"
 }
 
+# Why the last check failed, shown if we time out.
+last_error=''
+
 http_ok() {
   if have curl; then
-    curl -fsS -o /dev/null --max-time 5 "$1" 2>/dev/null
+    last_error=$(curl -fsS -o /dev/null --max-time 5 "$1" 2>&1)
   elif have wget; then
-    wget -q -O /dev/null -T 5 "$1" 2>/dev/null
+    last_error=$(wget -q -O /dev/null -T 5 "$1" 2>&1) && return 0
+    last_error=${last_error:-wget: request failed}
+    return 1
   else
     printf '%s: need curl or wget to check URLs\n' "$PROG" >&2
     exit 2
@@ -96,6 +101,7 @@ check() {
     *:*)     host=${target%:*}; port=${target##*:} ;;
     *)       host=localhost; port=$target ;;
   esac
+  last_error="nothing accepted a connection on ${host:-localhost} port $port"
   tcp_open "${host:-localhost}" "$port"
 }
 
@@ -114,6 +120,7 @@ for target in "${targets[@]}"; do
   until check "$target"; do
     if [ "$timeout" -gt 0 ] && [ "$SECONDS" -ge "$timeout" ]; then
       say "timed out after ${timeout}s waiting for $target"
+      [ -z "$last_error" ] || say "last attempt: $last_error"
       exit 1
     fi
     sleep "$interval"

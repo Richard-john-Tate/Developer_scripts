@@ -269,7 +269,8 @@ test_ports_lists_a_listener() {
   expect_status 0
   expect_out "$listen_port"
   expect_out "$listen_pid"
-  expect_out python3
+  # "ython": Linux shows "python3 -c ...", macOS the full path of Python.app.
+  expect_out ython
 }
 
 test_ports_reports_nothing_listening() {
@@ -357,11 +358,18 @@ test_wait_for_http_url() {
   have python3 || skip "python3 not installed"
   port=$(free_port)
   mkdir site && echo ok >site/health
-  (cd site && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1) &
+  (cd site && exec python3 -m http.server "$port" --bind 127.0.0.1 >../server.log 2>&1) &
   srv=$!
   run wait-for -t 10 "http://127.0.0.1:$port/health"
   kill "$srv" 2>/dev/null
-  expect_status 0
+  [ "$status" -eq 0 ] || fail "expected the URL to come up; server log: $(cat server.log)"
+}
+
+test_wait_for_explains_a_timeout() {
+  have python3 || skip "python3 not installed"
+  run wait-for -t 1 "127.0.0.1:$(free_port)"
+  expect_status 1
+  expect_out "last attempt: nothing accepted a connection"
 }
 
 # --- serve ------------------------------------------------------------------
@@ -782,6 +790,15 @@ test_gensecret_types() {
   run gensecret -t strong -c 50 8
   [ "$(printf '%s\n' "$out" | grep '[a-z]' | grep '[A-Z]' | grep '[0-9]' | grep -c '[^A-Za-z0-9]')" -eq 50 ] ||
     fail "a strong password is missing a character class: $out"
+}
+
+test_gensecret_quiet_when_sigpipe_is_ignored() {
+  # CI systems and some editors start programs with SIGPIPE ignored, which
+  # used to make "tr | head" print "write error: Broken pipe".
+  run bash -c "trap '' PIPE; gensecret; gensecret -t strong 40; gensecret -t pin"
+  expect_status 0
+  expect_no_out "rror"
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" -eq 3 ] || fail "expected 3 secrets"
 }
 
 test_gensecret_is_random_and_validates() {
@@ -1708,8 +1725,12 @@ test_favicon_makes_every_icon() {
   # A wide logo is centred on a transparent square, not stretched.
   [ "$(im site/icon-512.png -format '%[pixel:p{0,0}]' info:)" = "srgba(0,0,0,0)" ] ||
     fail "icon-512.png isn't padded with transparency"
-  [ "$(im_identify -format '%A' site/apple-touch-icon.png)" = False ] ||
-    fail "apple-touch-icon.png should have no transparency"
+  # %[opaque] checks the pixels themselves (the %A alpha flag reads
+  # differently between ImageMagick versions).
+  case $(im_identify -format '%[opaque]' site/apple-touch-icon.png) in
+    [Tt]rue) ;;
+    *) fail "apple-touch-icon.png should have no transparency" ;;
+  esac
 
   run favicon -d site logo.png
   expect_status 1

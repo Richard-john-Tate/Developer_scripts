@@ -103,8 +103,10 @@ if [ "$all" -eq 1 ]; then
     used=$(query inspect --format '{{.Image}}' $running)
   fi
   images=$(query images --no-trunc --format "{{.ID}}$tab{{.Repository}}:{{.Tag}}$tab{{.Size}}" |
-    awk -F'\t' -v used="$used" '
-      BEGIN { n = split(used, u, "\n"); for (i = 1; i <= n; i++) { sub(/^sha256:/, "", u[i]); inuse[u[i]] = 1 } }
+    # The list goes in through the environment: macOS awk rejects a -v value
+    # that contains newlines ("newline in string").
+    USED=$used awk -F'\t' '
+      BEGIN { n = split(ENVIRON["USED"], u, "\n"); for (i = 1; i <= n; i++) { sub(/^sha256:/, "", u[i]); inuse[u[i]] = 1 } }
       { id = $1; sub(/^sha256:/, "", id)
         if (!(id in inuse) && !seen[id]++) print $2 "  (" substr(id, 1, 12) ", " $3 ")" }')
 else
@@ -125,8 +127,8 @@ if [ "$volumes" -eq 1 ]; then
     mounted=$(query inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{println}}{{end}}{{end}}' $running)
   fi
   vols=$(query volume ls --format '{{.Name}}' |
-    awk -v mounted="$mounted" '
-      BEGIN { n = split(mounted, m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") keep[m[i]] = 1 }
+    MOUNTED=$mounted awk '
+      BEGIN { n = split(ENVIRON["MOUNTED"], m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") keep[m[i]] = 1 }
       $0 != "" && !($0 in keep)')
 fi
 
