@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""urldecode: decode %XX codes, or take a URL apart."""
+
+import argparse
+import os
+import sys
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit
+
+PROG = os.path.basename(sys.argv[0])
+
+HELP = f"""\
+Usage: {PROG} [options] [TEXT...]
+
+Turn %XX codes back into characters. With no TEXT, each line of standard
+input is decoded.
+
+With --parse, take a whole URL apart instead: scheme, host, port, path,
+fragment, and every query parameter decoded on its own line. Much easier
+than reading a long tracking link or OAuth redirect by eye.
+
+Options:
+  -f, --form   also turn + into a space (HTML form / query-string style)
+  -p, --parse  split a URL into its parts and decoded query parameters
+  -h, --help   show this help
+
+Examples:
+  {PROG} 'caf%C3%A9%20%26%20cr%C3%A8me'      # café & crème
+  {PROG} -p 'https://example.com/a%20b?q=big+cats&page=2#top'
+
+See also: urlencode"""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f'{PROG}: {message}\nTry "{PROG} --help".\n')
+        sys.exit(2)
+
+
+def parse_url(url):
+    parts = urlsplit(url)
+    rows = [("scheme", parts.scheme), ("user", unquote(parts.username or "")),
+            ("password", "(set)" if parts.password else ""), ("host", parts.hostname or "")]
+    try:
+        rows.append(("port", str(parts.port or "")))
+    except ValueError:
+        rows.append(("port", "(invalid)"))
+    rows += [("path", unquote(parts.path)), ("fragment", unquote(parts.fragment))]
+    for name, value in rows:
+        if value:
+            print(f"{name + ':':10} {value}")
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if query:
+        print("query:")
+        width = min(max(len(k) for k, _ in query), 30)
+        for key, value in query:
+            print(f"  {key:<{width}} = {value}")
+
+
+def main():
+    parser = Parser(prog=PROG, add_help=False, allow_abbrev=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-f", "--form", action="store_true")
+    parser.add_argument("-p", "--parse", action="store_true")
+    parser.add_argument("text", nargs="*")
+    args = parser.parse_args()
+    if args.help:
+        print(HELP)
+        return 0
+
+    # Odd bytes that aren't UTF-8 become U+FFFD instead of crashing.
+    if args.text:
+        lines = (t.encode("utf-8", "surrogateescape").decode("utf-8", "replace") for t in args.text)
+    else:
+        lines = (line.rstrip(b"\r\n").decode("utf-8", "replace") for line in sys.stdin.buffer)
+    for i, line in enumerate(lines):
+        if args.parse:
+            if i:
+                print()
+            parse_url(line.strip())
+        else:
+            print(unquote_plus(line) if args.form else unquote(line))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

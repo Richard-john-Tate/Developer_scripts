@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# ports: show which processes are listening on which TCP ports.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [PORT...]
+
+List the TCP ports that processes are listening on, with the process ID,
+user and command. Give port numbers to show only those ports.
+
+Without root you can only see your own processes; use "sudo $PROG" to see
+everyone's.
+
+Examples:
+  $PROG            # everything that is listening
+  $PROG 3000 8080  # who has 3000 and 8080?
+
+See also: killport
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+for arg in "$@"; do
+  case $arg in
+    -h|--help) usage; exit 0 ;;
+    -*) usage_error "unknown option: $arg" ;;
+    *[!0-9]*|'') usage_error "not a port number: $arg" ;;
+  esac
+done
+
+# Print "port<TAB>pid" for every listening TCP socket. The tools exit 1
+# when they find nothing, which isn't an error here.
+listeners() {
+  if have lsof; then
+    # -F output is stable: "p<pid>" lines, then "n<addr>:<port>" lines.
+    { lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null || true; } |
+      awk '/^p/ { pid = substr($0, 2) }
+           /^n/ { n = split($0, a, ":"); print a[n] "\t" pid }'
+  elif have ss; then
+    { ss -Htlnp 2>/dev/null || true; } |
+      awk '{ n = split($4, a, ":"); port = a[n]
+             if (match($0, /pid=[0-9]+/)) print port "\t" substr($0, RSTART + 4, RLENGTH - 4)
+             else print port "\t-" }'
+  elif have netstat; then
+    # Linux net-tools: "tcp 0 0 0.0.0.0:22 0.0.0.0:* LISTEN 812/sshd"
+    { netstat -tlnp 2>/dev/null || true; } |
+      awk '$6 == "LISTEN" { n = split($4, a, ":"); split($7, p, "/")
+                            print a[n] "\t" (p[1] ~ /^[0-9]+$/ ? p[1] : "-") }'
+  else
+    die "need one of lsof, ss or netstat"
+  fi
+}
+
+rows=$(listeners | sort -t "$(printf '\t')" -k1,1n -k2,2n | uniq)
+
+if [ $# -gt 0 ]; then
+  rows=$(printf '%s\n' "$rows" | awk -F'\t' -v want=" $* " 'index(want, " " $1 " ")')
+fi
+
+if [ -z "$rows" ]; then
+  if [ $# -gt 0 ]; then
+    echo "Nothing you can see is listening on port(s): $*" >&2
+  else
+    echo "No listening TCP ports found." >&2
+  fi
+  [ "$(id -u)" -eq 0 ] || echo "(processes owned by other users only show up with sudo)" >&2
+  exit 1
+fi
+
+printf '%-7s %-8s %-10s %s\n' PORT PID USER COMMAND
+printf '%s\n' "$rows" | while IFS=$'\t' read -r port pid; do
+  if [ "$pid" != - ] && info=$(ps -o user= -o command= -p "$pid" 2>/dev/null); then
+    user=${info%% *}
+    cmd=${info#"$user"}
+    cmd=${cmd#"${cmd%%[! ]*}"}   # trim leading spaces
+  else
+    user='?' cmd='?'
+  fi
+  printf '%-7s %-8s %-10s %.120s\n' "$port" "$pid" "$user" "$cmd"
+done

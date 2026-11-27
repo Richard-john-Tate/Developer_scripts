@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# mkscript: start a new shell script from a sensible template.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] NAME [DESCRIPTION]
+
+Create an executable bash script called NAME with the boilerplate already
+written: strict mode, a --help message, option parsing and error helpers.
+Then open it in \$EDITOR, if that is set.
+
+Options:
+  -f, --force      overwrite NAME if it already exists
+  -E, --no-edit    don't open the new script in \$EDITOR
+  -h, --help       show this help
+
+Examples:
+  $PROG deploy "Build and ship the site"
+  $PROG -E ~/bin/cleanup-logs
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+force=0 edit=1 args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -f|--force)   force=1 ;;
+    -E|--no-edit) edit=0 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; args+=("$@"); break ;;
+    -*)           usage_error "unknown option: $1" ;;
+    *)            args+=("$1") ;;
+  esac
+  shift
+done
+[ ${#args[@]} -ge 1 ] || usage_error "give the new script a name"
+[ ${#args[@]} -le 2 ] || usage_error "too many arguments (quote the description)"
+
+path=${args[0]}
+case $path in -*) path=./$path ;; esac   # so basename and mkdir don't see an option
+name=$(basename "$path")
+description=${args[1]:-TODO: say what $name does}
+case $path$description in
+  *"
+"*) usage_error "the name and description must be on one line" ;;
+esac
+# The description goes inside a heredoc in the new script, where \, $ and
+# backticks would be treated as code. Escape them there.
+usage_description=$(printf '%s\n' "$description" | sed 's/[\\$`]/\\&/g')
+
+# A symlink counts as existing even if its target doesn't, and is replaced
+# rather than written through (which would change the file it points to).
+if [ -e "$path" ] || [ -L "$path" ]; then
+  [ "$force" -eq 1 ] || die "$path already exists (use --force to overwrite)"
+  [ ! -d "$path" ] || [ -L "$path" ] || die "$path is a directory"
+  rm -f -- "$path"
+fi
+mkdir -p "$(dirname "$path")"
+
+# The template uses \$ so the variables end up in the new script, not here.
+cat >"$path" <<EOF
+#!/usr/bin/env bash
+#
+# $name: $description
+#
+set -euo pipefail
+
+readonly PROG=\${0##*/}
+
+usage() {
+  cat <<USAGE
+Usage: \$PROG [options] ARG...
+
+$usage_description
+
+Options:
+  -v, --verbose  print more about what's happening
+  -h, --help     show this help
+USAGE
+}
+
+die() { printf '%s: %s\n' "\$PROG" "\$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "\$PROG" "\$*" "\$PROG" >&2; exit 2; }
+log() { [ "\$verbose" -eq 0 ] || printf '%s: %s\n' "\$PROG" "\$*" >&2; }
+
+verbose=0 args=()
+while [ \$# -gt 0 ]; do
+  case \$1 in
+    -v|--verbose) verbose=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; args+=("\$@"); break ;;
+    -*)           usage_error "unknown option: \$1" ;;
+    *)            args+=("\$1") ;;
+  esac
+  shift
+done
+[ \${#args[@]} -gt 0 ] || usage_error "missing ARG"
+
+# A scratch folder that is removed however the script exits. Delete these
+# two lines if you don't need it.
+tmp=\$(mktemp -d "\${TMPDIR:-/tmp}/\$PROG.XXXXXX")
+trap 'rm -rf "\$tmp"' EXIT
+
+main() {
+  local arg
+  for arg in "\${args[@]}"; do
+    log "working on \$arg"
+    # TODO: do something with "\$arg"
+    echo "\$arg"
+  done
+}
+
+main
+EOF
+chmod +x "$path"
+echo "Created $path"
+
+if [ "$edit" -eq 1 ] && [ -n "${EDITOR:-}" ] && [ -t 0 ] && [ -t 1 ]; then
+  # EDITOR may contain arguments, e.g. "code --wait"; let the shell split them.
+  # shellcheck disable=SC2086
+  exec $EDITOR "$path"
+fi

@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+#
+# imgresize: make images smaller, keeping their shape.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] IMAGE...
+
+Resize each IMAGE and save it as NAME.resized.EXT next to the original.
+The shape is always kept, and images are never enlarged: an image that is
+already small enough is copied at its own size. Photos are turned upright
+first (using their EXIF orientation), so width and height mean what you
+see.
+
+Say how big with one of:
+  -w, --width PX     at most PX wide
+      --height PX    at most PX high (with --width: fit inside that box)
+  -m, --max PX       longest side at most PX, e.g. 1920
+  -p, --percent N    N percent of the current size (1-100)
+
+Other options:
+  -o, --output FILE  where to write (only with a single IMAGE)
+  -f, --force        overwrite output files that already exist
+  -h, --help         show this help
+
+Needs ImageMagick. Animated GIFs stay animated.
+
+Examples:
+  $PROG -m 1920 holiday/*.jpg
+  $PROG -w 800 -o banner-small.png banner.png
+  $PROG -p 50 screenshot.png
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+width='' height='' max='' percent='' output='' force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -w|--width)   [ $# -ge 2 ] || usage_error "$1 needs a value"; width=$2; shift ;;
+    --height)     [ $# -ge 2 ] || usage_error "$1 needs a value"; height=$2; shift ;;
+    -m|--max)     [ $# -ge 2 ] || usage_error "$1 needs a value"; max=$2; shift ;;
+    -p|--percent) [ $# -ge 2 ] || usage_error "$1 needs a value"; percent=${2%\%}; shift ;;
+    -o|--output)  [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)   force=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; inputs+=("$@"); break ;;
+    -*)           usage_error "unknown option: $1" ;;
+    *)            inputs+=("$1") ;;
+  esac
+  shift
+done
+[ ${#inputs[@]} -gt 0 ] || usage_error "give at least one image"
+[ -z "$output" ] || [ ${#inputs[@]} -eq 1 ] || usage_error "--output only works with a single image"
+
+for value in "$width" "$height" "$max" "$percent"; do
+  case $value in '') ;; *[!0-9]*|0) usage_error "sizes must be whole numbers above 0, got '$value'" ;; esac
+done
+if [ -n "$percent" ]; then
+  [ -z "$width$height$max" ] || usage_error "use --percent on its own"
+  [ "$percent" -le 100 ] || usage_error "--percent can't be over 100 ($PROG never enlarges)"
+  geometry="$percent%"
+elif [ -n "$max" ]; then
+  [ -z "$width$height" ] || usage_error "use --max on its own, or --width/--height"
+  geometry="${max}x${max}>"
+elif [ -n "$width" ] || [ -n "$height" ]; then
+  geometry="${width}x${height}>"   # ">" means only ever shrink
+else
+  usage_error "say how big: --width, --height, --max or --percent"
+fi
+
+# ImageMagick 7 is one "magick" command; version 6 has "convert" and "identify".
+if have magick; then
+  IM=(magick) IDENTIFY=(magick identify)
+elif have convert && have identify; then
+  IM=(convert) IDENTIFY=(identify)
+else
+  die "needs ImageMagick (macOS: brew install imagemagick; Debian/Ubuntu: sudo apt install imagemagick)"
+fi
+
+# What this ImageMagick can do with a format: "rw+" for JPEG, "r--" for a
+# read-only one like HEIC, nothing if it doesn't know it.
+FORMATS=$("${IM[@]}" -list format 2>/dev/null || true)
+format_mode() {
+  printf '%s\n' "$FORMATS" | awk -v want="$1" '
+    { name = toupper($1); sub(/\*$/, "", name) }
+    name == want && mode == "" { for (i = 2; i <= NF; i++) if ($i ~ /^[r-][w-][+-]$/) { mode = $i; break } }
+    END { print mode }'
+}
+# ImageMagick's name for the format a file extension stands for.
+format_of() {
+  case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') in
+    jpg|jpeg|jpe) echo JPEG ;;
+    tif|tiff)     echo TIFF ;;
+    heic|heif)    echo HEIC ;;
+    *)            printf '%s' "$1" | tr '[:lower:]' '[:upper:]' ;;
+  esac
+}
+
+# Work out every output first, so nothing is written if any would fail.
+outputs=() notes=()
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+  dir=$(dirname -- "$input") base=$(basename -- "$input") ext=''
+  case $base in ?*.*) ext=${base##*.}; base=${base%.*} ;; esac
+  [ -n "$ext" ] || die "$input has no file extension, so its format is unclear; use --output NAME.EXT"
+  note=''
+  if [ -n "$output" ]; then
+    out=$output
+  else
+    # Formats this ImageMagick can read but not write (HEIC, often AVIF)
+    # are saved as JPEG instead.
+    case $(format_mode "$(format_of "$ext")") in
+      ?w?) ;;
+      *)   note=" (as JPEG: this ImageMagick can't write .$ext)"; ext=jpg ;;
+    esac
+    out=$base.resized.$ext
+    [ "$dir" = . ] || out=$dir/$out
+  fi
+  case $out in -*) out=./$out ;; esac
+  case $out in
+    *.*) case $(format_mode "$(format_of "${out##*.}")") in
+           ?w?) ;;
+           *) die "$out: this ImageMagick can't write .${out##*.} files" ;;
+         esac ;;
+    *) die "$out needs a file extension such as .jpg or .png" ;;
+  esac
+  if [ -e "$out" ]; then
+    [ ! "$out" -ef "$input" ] || die "the output can't be the input file ($out)"
+    [ "$force" -eq 1 ] || die "$out already exists (use --force to overwrite)"
+  fi
+  outputs+=("$out")
+  notes+=("$note")
+done
+
+partial=''
+trap '[ -z "$partial" ] || rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+status=0
+i=0
+for input in "${inputs[@]}"; do
+  out=${outputs[$i]} note=${notes[$i]}
+  i=$((i + 1))
+  case $input in -*) input=./$input ;; esac
+  out_format=$(format_of "${out##*.}")
+
+  # Formats that hold one picture get the first frame only; otherwise
+  # ImageMagick would write name-0.jpg, name-1.jpg, ... for an animation.
+  case $out_format in
+    GIF)          set -- "$input" -coalesce -auto-orient -resize "$geometry" -layers Optimize ;;
+    TIFF|WEBP|ICO) set -- "$input" -auto-orient -resize "$geometry" ;;
+    *)            set -- "${input}[0]" -auto-orient -resize "$geometry" ;;
+  esac
+
+  before=$("${IDENTIFY[@]}" -format '%wx%h' "${input}[0]" 2>/dev/null || echo '?')
+  partial=$(dirname -- "$out")/.$(basename -- "$out").partial.$$.${out##*.}
+  # The FORMAT: prefix makes ImageMagick write that format whatever the
+  # temporary file is called.
+  if "${IM[@]}" "$@" "$out_format:$partial" && [ -s "$partial" ]; then
+    mv -f "$partial" "$out"
+    after=$("${IDENTIFY[@]}" -format '%wx%h' "${out}[0]" 2>/dev/null || echo '?')
+    echo "$input ($before) -> $out ($after)$note"
+  else
+    rm -f "$partial"
+    printf '%s: failed to resize %s\n' "$PROG" "$input" >&2
+    status=1
+  fi
+  partial=''
+done
+exit "$status"

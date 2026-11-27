@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# git-sync: bring the current branch up to date with the base branch.
+#
+# Because it is named git-*, git runs it as a subcommand:  git sync
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options]
+
+Fetch from the remote, fast-forward your local base branch (main/master),
+then rebase the current branch onto it. Uncommitted changes are stashed
+and restored automatically.
+
+If you are on the base branch itself it is simply fast-forwarded.
+
+Options:
+  -b, --base BRANCH  base branch (default: the remote's HEAD, else main,
+                     else master)
+  -r, --remote NAME  remote to sync with (default: origin)
+  -m, --merge        merge the base branch in instead of rebasing
+  -h, --help         show this help
+
+If the rebase or merge hits a conflict, git stops and tells you what to do;
+fix the files, then run "git rebase --continue" (or "git merge --continue").
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+step() { printf '==> %s\n' "$*"; }
+
+base='' remote=origin merge=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -b|--base)   [ $# -ge 2 ] || usage_error "$1 needs a value"; base=$2; shift ;;
+    -r|--remote) [ $# -ge 2 ] || usage_error "$1 needs a value"; remote=$2; shift ;;
+    -m|--merge)  merge=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage_error "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
+git remote get-url "$remote" >/dev/null 2>&1 || die "no remote named '$remote'"
+
+git_dir=$(git rev-parse --git-dir)
+if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+  die "a rebase is already in progress; finish it or run 'git rebase --abort'"
+fi
+if [ -f "$git_dir/MERGE_HEAD" ]; then
+  die "a merge is already in progress; finish it or run 'git merge --abort'"
+fi
+
+current=$(git symbolic-ref --quiet --short HEAD) || die "HEAD is detached; check out a branch first"
+
+step "Fetching $remote"
+git fetch --prune "$remote"
+
+if [ -z "$base" ]; then
+  base=$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null || true)
+  base=${base#"$remote"/}
+  if [ -z "$base" ]; then
+    for candidate in main master; do
+      if git show-ref --verify --quiet "refs/remotes/$remote/$candidate"; then
+        base=$candidate; break
+      fi
+    done
+  fi
+  [ -n "$base" ] || die "can't work out the base branch; pass one with --base"
+fi
+
+upstream=$remote/$base
+git show-ref --verify --quiet "refs/remotes/$upstream" || die "'$upstream' doesn't exist"
+
+if [ "$current" = "$base" ]; then
+  step "Fast-forwarding $base to $upstream"
+  git merge --ff-only --autostash "$upstream" ||
+    die "'$base' has diverged from '$upstream'; rebase or merge it by hand"
+  exit 0
+fi
+
+# Fast-forward the local base branch without checking it out. Fetching from
+# "." into a branch only allows fast-forwards and refuses if the branch is
+# checked out in another worktree, so this can never lose commits.
+if git show-ref --verify --quiet "refs/heads/$base"; then
+  if git fetch --quiet . "refs/remotes/$upstream:refs/heads/$base" 2>/dev/null; then
+    step "Local $base now matches $upstream"
+  else
+    printf 'warning: could not fast-forward local %s (it has commits that are not on %s,\n         or it is checked out in another worktree); leaving it alone\n' "$base" "$upstream" >&2
+  fi
+fi
+
+if [ "$merge" -eq 1 ]; then
+  step "Merging $upstream into $current"
+  git merge --autostash --no-edit "$upstream"
+else
+  step "Rebasing $current onto $upstream"
+  git rebase --autostash "$upstream"
+fi

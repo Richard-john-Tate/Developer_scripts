@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# envcheck: compare a .env file against .env.example.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [ENV_FILE [EXAMPLE_FILE]]
+
+Check that ENV_FILE (default: .env) defines every variable listed in
+EXAMPLE_FILE (default: the first of .env.example, .env.sample,
+.env.template or .env.dist). Catches the "works on my machine" bug where
+someone added a setting and you never copied it over.
+
+Reports keys that are missing, keys that are set but empty, and keys in
+ENV_FILE that the example doesn't mention. Only key names are printed,
+never values, so the output is safe to paste.
+
+Options:
+  -s, --strict  also fail if keys are empty or not in the example
+  -q, --quiet   print nothing, just set the exit status
+  -h, --help    show this help
+
+Exit status: 0 if everything is fine, 1 if keys are missing (or, with
+--strict, empty or extra), 2 on usage errors.
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+strict=0 quiet=0 files=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -s|--strict) strict=1 ;;
+    -q|--quiet)  quiet=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    -*)          usage_error "unknown option: $1" ;;
+    *)           files+=("$1") ;;
+  esac
+  shift
+done
+[ ${#files[@]} -le 2 ] || usage_error "too many arguments"
+
+env_file=${files[0]:-.env}
+example=${files[1]:-}
+if [ -z "$example" ]; then
+  for candidate in .env.example .env.sample .env.template .env.dist; do
+    if [ -f "$(dirname "$env_file")/$candidate" ]; then
+      example=$(dirname "$env_file")/$candidate
+      break
+    fi
+  done
+  [ -n "$example" ] || die "no .env.example (or .sample/.template/.dist) found; name one explicitly"
+fi
+[ -f "$example" ] || die "no such file: $example"
+[ -f "$env_file" ] || die "no such file: $env_file (copy it from $example to get started)"
+
+# Print "KEY<TAB>empty|set" for each assignment. Handles "export KEY=...",
+# spaces around "=", quoted values and comments; ignores everything else.
+parse() {
+  awk '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      if (!match(line, /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/)) next
+      key = substr(line, 1, RLENGTH - 1); sub(/[[:space:]]+$/, "", key)
+      val = substr(line, RLENGTH + 1)
+      sub(/^[[:space:]]+/, "", val)
+      if (val !~ /^["\047]/) sub(/[[:space:]]+#.*$/, "", val)   # inline comment
+      sub(/[[:space:]]+$/, "", val)
+      state = (val == "" || val == "\"\"" || val == "\047\047") ? "empty" : "set"
+      print key "\t" state
+    }' "$1" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -u
+}
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/envcheck.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+parse "$env_file" >"$tmp/env"
+parse "$example" >"$tmp/example"
+cut -f1 "$tmp/env" >"$tmp/env.keys"
+cut -f1 "$tmp/example" >"$tmp/example.keys"
+
+missing=$(LC_ALL=C comm -13 "$tmp/env.keys" "$tmp/example.keys")
+extra=$(LC_ALL=C comm -23 "$tmp/env.keys" "$tmp/example.keys")
+# Examples often leave secrets blank (API_KEY=), so a key that is still
+# empty in .env is usually one somebody forgot to fill in.
+empty=$(awk -F'\t' '$2 == "empty" { print $1 }' "$tmp/env")
+
+report() {   # $1 = heading, $2 = newline-separated keys
+  [ -n "$2" ] || return 0
+  [ "$quiet" -eq 1 ] && return 0
+  printf '%s\n' "$1"
+  printf '%s\n' "$2" | sed 's/^/  /'
+}
+
+report "Missing from $env_file (in $example):" "$missing"
+report "Empty in $env_file:" "$empty"
+report "In $env_file but not in $example:" "$extra"
+
+status=0
+[ -z "$missing" ] || status=1
+if [ "$strict" -eq 1 ] && { [ -n "$empty" ] || [ -n "$extra" ]; }; then status=1; fi
+
+if [ "$status" -eq 0 ] && [ "$quiet" -eq 0 ]; then
+  printf '%s has every key in %s (%d keys).\n' "$env_file" "$example" "$(grep -c . "$tmp/example.keys" || true)"
+fi
+exit "$status"

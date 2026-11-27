@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""jsonfmt: pretty-print, minify or check JSON."""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import uuid
+
+PROG = os.path.basename(sys.argv[0])
+
+HELP = f"""\
+Usage: {PROG} [options] [FILE...]
+
+Pretty-print JSON from each FILE, or from standard input if there are
+none. If the JSON is broken, says exactly where (line, column and the
+text around it).
+
+Numbers are copied exactly as written, so big IDs and precise decimals
+are never rounded the way many tools (and JavaScript) round them.
+
+Options:
+  -c, --compact      print on one line with no spaces (minify)
+  -s, --sort-keys    sort the keys of every object
+  -i, --indent N     spaces per level (default: 2)
+  -w, --write        reformat each FILE in place instead of printing it
+      --check        print nothing; exit with status 1 if any input is
+                     not valid JSON
+  -h, --help         show this help
+
+Examples:
+  curl -s https://api.github.com/repos/git/git | {PROG}
+  {PROG} --check config/*.json
+  {PROG} -w -s package.json"""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f'{PROG}: {message}\nTry "{PROG} --help".\n')
+        sys.exit(2)
+
+
+class Number:
+    """A number kept as the exact text it was written as."""
+    __slots__ = ("text",)
+
+    def __init__(self, text):
+        self.text = text
+
+
+class Invalid(Exception):
+    pass
+
+
+def parse(text, name):
+    duplicates = []
+
+    def make_object(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                duplicates.append(key)
+            obj[key] = value
+        return obj
+
+    def reject_constant(constant):
+        raise Invalid(f"{name}: {constant} is not allowed in JSON")
+
+    if not text.strip():
+        raise Invalid(f"{name}: empty input")
+    try:
+        value = json.loads(text, parse_float=Number, parse_int=Number,
+                           parse_constant=reject_constant, object_pairs_hook=make_object)
+    except json.JSONDecodeError as err:
+        raise Invalid(describe_error(err, text, name)) from None
+    for key in dict.fromkeys(duplicates):
+        sys.stderr.write(f"{PROG}: warning: {name}: duplicate key {json.dumps(key)}; "
+                         "only the last value is kept\n")
+    return value
+
+
+def describe_error(err, text, name):
+    """The error with its position and the offending line, caret underneath."""
+    lines = text.splitlines() or [""]
+    line = lines[min(err.lineno, len(lines)) - 1]
+    col = err.colno - 1
+    start = max(0, col - 40)           # show at most ~80 characters around it
+    snippet = line[start:col + 40]
+    prefix = "..." if start else ""
+    return (f"{name}: line {err.lineno}, column {err.colno}: {err.msg}\n"
+            f"  {prefix}{snippet}\n  {' ' * (len(prefix) + col - start)}^")
+
+
+def render(value, compact, indent, sort_keys):
+    # Numbers go out as placeholders, then the exact original text is put
+    # back. The token is random, so it can't collide with real strings.
+    token = uuid.uuid4().hex
+    numbers = []
+
+    def default(obj):
+        if isinstance(obj, Number):
+            numbers.append(obj.text)
+            return f"{token}{len(numbers) - 1}"
+        raise TypeError(f"can't encode {type(obj).__name__}")
+
+    out = json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, default=default,
+                     indent=None if compact else indent,
+                     separators=(",", ":") if compact else (",", ": "))
+    return re.sub(f'"{token}(\\d+)"', lambda m: numbers[int(m.group(1))], out) + "\n"
+
+
+def read(path):
+    data = sys.stdin.buffer.read() if path == "-" else open(path, "rb").read()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as err:
+        raise Invalid(f"{path}: not UTF-8 text (bad byte at offset {err.start})") from None
+
+
+def write_in_place(path, text):
+    """Replace path's contents via a temporary file, keeping its permissions."""
+    folder = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=f".{os.path.basename(path)}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def main():
+    parser = Parser(prog=PROG, add_help=False, allow_abbrev=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-c", "--compact", action="store_true")
+    parser.add_argument("-s", "--sort-keys", action="store_true")
+    parser.add_argument("-i", "--indent", type=int, default=2)
+    parser.add_argument("-w", "--write", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("files", nargs="*")
+    args = parser.parse_args()
+    if args.help:
+        print(HELP)
+        return 0
+    if not 0 <= args.indent <= 16:
+        parser.error("--indent must be between 0 and 16")
+    if args.write and args.check:
+        parser.error("use --write or --check, not both")
+    if args.write and (not args.files or "-" in args.files):
+        parser.error("--write needs file names (it can't rewrite standard input)")
+
+    status = 0
+    for path in args.files or ["-"]:
+        name = "(stdin)" if path == "-" else path
+        try:
+            text = read(path)
+            value = parse(text, name)
+        except OSError as err:
+            sys.stderr.write(f"{PROG}: {path}: {err.strerror}\n")
+            status = 1
+            continue
+        except Invalid as err:
+            sys.stderr.write(f"{PROG}: {err}\n")
+            status = 1
+            continue
+        if args.check:
+            continue
+        out = render(value, args.compact, args.indent, args.sort_keys)
+        if args.write:
+            if out != text:
+                write_in_place(path, out)
+                print(f"reformatted {path}")
+        else:
+            sys.stdout.write(out)
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # The reader went away (e.g. piped into head): stop quietly.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

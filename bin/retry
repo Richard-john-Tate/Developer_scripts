@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# retry: run a command until it succeeds, backing off between attempts.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [--] COMMAND [ARGS...]
+
+Run COMMAND. If it fails, wait and try again, doubling the wait each
+time, until it succeeds or you run out of attempts. Good for flaky
+network calls, services that are still starting, and CI steps.
+
+Options:
+  -n, --attempts N   give up after N attempts (default: 5; 0 = never give up)
+  -d, --delay SECS   wait before the second attempt (default: 1)
+  -m, --max-delay S  never wait longer than this (default: 60)
+  -b, --backoff N    multiply the wait by N after each failure (default: 2;
+                     use 1 for a fixed delay)
+  -q, --quiet        don't print anything between attempts
+  -h, --help         show this help
+
+The exit status is COMMAND's: 0 once it succeeds, or its last failing
+status if every attempt fails.
+
+Examples:
+  $PROG curl -fsS https://example.com/health
+  $PROG -n 10 -d 2 -- git push
+  $PROG -n 0 -b 1 -d 5 ./check-deploy.sh    # every 5s, forever
+EOF
+}
+
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+attempts=5 delay=1 max_delay=60 backoff=2 quiet=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--attempts)  [ $# -ge 2 ] || usage_error "$1 needs a value"; attempts=$2; shift ;;
+    -d|--delay)     [ $# -ge 2 ] || usage_error "$1 needs a value"; delay=$2; shift ;;
+    -m|--max-delay) [ $# -ge 2 ] || usage_error "$1 needs a value"; max_delay=$2; shift ;;
+    -b|--backoff)   [ $# -ge 2 ] || usage_error "$1 needs a value"; backoff=$2; shift ;;
+    -q|--quiet)     quiet=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    --)             shift; break ;;
+    -*)             usage_error "unknown option: $1" ;;
+    *)              break ;;   # first word of the command
+  esac
+  shift
+done
+[ $# -gt 0 ] || usage_error "no command given"
+
+for value in "$attempts" "$delay" "$max_delay" "$backoff"; do
+  case $value in ''|*[!0-9]*) usage_error "option values must be whole numbers, got '$value'" ;; esac
+done
+# Force base 10, or bash reads "08" as a bad octal number.
+attempts=$((10#$attempts)) delay=$((10#$delay)) max_delay=$((10#$max_delay)) backoff=$((10#$backoff))
+
+say() { [ "$quiet" -eq 1 ] || printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+attempt=1
+while :; do
+  status=0
+  "$@" || status=$?
+  [ "$status" -ne 0 ] || exit 0
+
+  if [ "$attempts" -gt 0 ] && [ "$attempt" -ge "$attempts" ]; then
+    say "giving up after $attempt attempt(s); last exit status $status"
+    exit "$status"
+  fi
+
+  say "attempt $attempt failed (exit $status); retrying in ${delay}s"
+  sleep "$delay"
+  attempt=$((attempt + 1))
+  delay=$((delay * backoff))
+  [ "$delay" -le "$max_delay" ] || delay=$max_delay
+done

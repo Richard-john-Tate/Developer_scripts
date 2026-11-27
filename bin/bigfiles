@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# bigfiles: find the largest files in a directory, or in a repo's history.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [DIR]
+
+List the largest files under DIR (default: the current directory).
+Skips .git, node_modules and other dependency and cache folders unless
+you pass --all.
+
+Options:
+  -n, --count N  how many to show (default: 20)
+  -a, --all      look inside .git, node_modules, etc. too
+  -g, --git      list the largest files ever committed to this git repo,
+                 including ones that were later deleted. They make
+                 clones slow even after they're gone from the tree
+  -h, --help     show this help
+
+Examples:
+  $PROG ~/Downloads
+  $PROG -g -n 10      # what is bloating this repo?
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+count=20 all=0 git=0 dir=.
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--count) [ $# -ge 2 ] || usage_error "$1 needs a value"; count=$2; shift ;;
+    -a|--all)   all=1 ;;
+    -g|--git)   git=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         usage_error "unknown option: $1" ;;
+    *)          dir=$1 ;;
+  esac
+  shift
+done
+case $count in ''|*[!0-9]*) usage_error "--count must be a whole number" ;; esac
+[ -d "$dir" ] || die "not a directory: $dir"
+
+# Read "bytes<TAB>path" lines; print the top $count with readable sizes.
+report() {
+  # awk (not head) trims the list: it reads all its input, so sort never
+  # dies of SIGPIPE and trips pipefail.
+  sort -t "$(printf '\t')" -k1,1nr |
+    awk -F'\t' -v n="$count" '
+      function human(b,   u, i) {
+        split("B K M G T", u, " ")
+        for (i = 1; b >= 1024 && i < 5; i++) b /= 1024
+        return (i == 1) ? sprintf("%d%s", b, u[i]) : sprintf("%.1f%s", b, u[i])
+      }
+      NR <= n { printf "%8s  %s\n", human($1), $2 }'
+}
+
+if [ "$git" -eq 1 ]; then
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $dir"
+  tab=$(printf '\t')
+  # Every blob reachable from any ref, listed once with a path it had.
+  git -C "$dir" rev-list --objects --all |
+    git -C "$dir" cat-file --batch-check="%(objecttype)${tab}%(objectsize)${tab}%(rest)" 2>/dev/null |
+    awk -F'\t' '$1 == "blob" { print $2 "\t" $3 }' |
+    report
+  exit 0
+fi
+
+# -H follows DIR if it's a symlink; -mindepth 1 stops DIR itself being
+# skipped when it is called, say, .cache or venv.
+case $dir in -*) dir=./$dir ;; esac
+set -- -H "$dir" -mindepth 1
+if [ "$all" -eq 0 ]; then
+  set -- "$@" \( -name .git -o -name node_modules -o -name .venv -o -name venv \
+    -o -name __pycache__ -o -name .tox -o -name .cache -o -name .gradle \
+    -o -name .next -o -name .terraform \) -prune -o
+fi
+set -- "$@" -type f
+
+# GNU find prints sizes itself. Otherwise ask stat, which is GNU stat if
+# coreutils is installed (e.g. via Homebrew) and BSD stat if not. find exits
+# non-zero if it meets an unreadable folder; the rest of the list still counts.
+{
+  if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    find "$@" -printf '%s\t%p\n'
+  elif stat -c %s / >/dev/null 2>&1; then
+    find "$@" -exec stat --printf '%s\t%n\n' {} +
+  else
+    find "$@" -exec stat -f '%z%t%N' {} +
+  fi 2>/dev/null || true
+} | report

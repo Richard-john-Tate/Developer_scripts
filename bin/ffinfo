@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# ffinfo: a short, readable summary of audio and video files.
+#
+set -euo pipefail
+export LC_NUMERIC=C   # awk prints decimals with "." whatever the locale
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] FILE...
+
+Show what's in each media file: container, length, size and bitrate, then
+one line per stream (video, audio, subtitles) with its codec, resolution,
+frame rate, channels and language. Much easier to read than ffprobe.
+
+Options:
+  -j, --json  print ffprobe's full JSON report instead
+  -h, --help  show this help
+
+Example:
+  $PROG holiday.mov
+    holiday.mov
+      QuickTime / MOV, 2:14, 412.3 MB, 25.1 Mb/s
+      #0 video     hevc 3840x2160 29.97 fps 24.8 Mb/s
+      #1 audio     aac stereo 48 kHz 256 kb/s [eng]
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+json=0 files=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -j|--json) json=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; files+=("$@"); break ;;
+    -*)        usage_error "unknown option: $1" ;;
+    *)         files+=("$1") ;;
+  esac
+  shift
+done
+[ ${#files[@]} -gt 0 ] || usage_error "give at least one file"
+have ffprobe || die "needs ffprobe, which comes with ffmpeg (macOS: brew install ffmpeg; Debian/Ubuntu: sudo apt install ffmpeg)"
+
+status=0
+for file in "${files[@]}"; do
+  if [ ! -f "$file" ]; then
+    printf '%s: no such file: %s\n' "$PROG" "$file" >&2
+    status=1
+    continue
+  fi
+
+  if [ "$json" -eq 1 ]; then
+    ffprobe -v error -show_format -show_streams -of json -- "$file" || status=1
+    continue
+  fi
+
+  if ! report=$(ffprobe -v error -of default=noprint_wrappers=0 \
+      -show_entries 'format=format_long_name,duration,size,bit_rate:stream=index,codec_type,codec_name,profile,width,height,avg_frame_rate,r_frame_rate,channels,channel_layout,sample_rate,bit_rate:stream_tags=language' \
+      -- "$file" 2>&1); then
+    printf '%s: %s: not a media file ffprobe can read (%s)\n' "$PROG" "$file" "$report" >&2
+    status=1
+    continue
+  fi
+
+  printf '%s\n' "$file"
+  # ffprobe prints [STREAM]...[/STREAM] and [FORMAT]...[/FORMAT] blocks of
+  # key=value lines; collect each block, then print it as one line.
+  printf '%s\n' "$report" | awk '
+    function human(b,   u, i) {
+      split("B KB MB GB TB", u, " ")
+      for (i = 1; b >= 1024 && i < 5; i++) b /= 1024
+      return (i == 1) ? sprintf("%d %s", b, u[i]) : sprintf("%.1f %s", b, u[i])
+    }
+    function rate(bps) {
+      if (bps !~ /^[0-9]+$/) return ""
+      bps += 0   # values from the report are strings; compare them as numbers
+      return (bps >= 1000000) ? sprintf("%.1f Mb/s", bps / 1000000) : sprintf("%d kb/s", bps / 1000 + 0.5)
+    }
+    function clock(s,   h, m) {
+      if (s !~ /^[0-9.]+$/) return "unknown length"
+      s += 0
+      if (s < 10) return sprintf("%.1fs", s)
+      s = int(s + 0.5); h = int(s / 3600); m = int((s % 3600) / 60); s = s % 60
+      return h ? sprintf("%d:%02d:%02d", h, m, s) : sprintf("%d:%02d", m, s)
+    }
+    function fps(r,   p) {
+      if (split(r, p, "/") != 2 || p[2] == 0 || p[1] == 0) return ""
+      r = p[1] / p[2]
+      return (r == int(r)) ? sprintf("%d fps", r) : sprintf("%.2f fps", r)
+    }
+    function add(s, x) { return (x == "") ? s : s " " x }
+    /^\[(STREAM|FORMAT)\]$/ { split("", f); next }   # empty the array (portable "delete f")
+    /^\[\/STREAM\]$/ {
+      line = sprintf("  #%s %-9s %s", f["index"], f["codec_type"], f["codec_name"])
+      if (f["codec_type"] == "video") {
+        line = add(line, f["width"] "x" f["height"])
+        r = fps(f["avg_frame_rate"]); if (r == "") r = fps(f["r_frame_rate"])
+        line = add(line, r)
+      } else if (f["codec_type"] == "audio") {
+        ch = f["channel_layout"]
+        if (ch == "" || ch == "unknown") ch = (f["channels"] + 0 == 1 ? "mono" : f["channels"] " ch")
+        line = add(line, ch)
+        if (f["sample_rate"] ~ /^[0-9]+$/) line = add(line, (f["sample_rate"] / 1000) " kHz")
+      }
+      line = add(line, rate(f["bit_rate"]))
+      lang = f["TAG:language"]   # "und" means no language was set
+      if (lang != "" && lang != "und") line = add(line, "[" lang "]")
+      streams[++n] = line
+      next
+    }
+    /^\[\/FORMAT\]$/ {
+      size = (f["size"] ~ /^[0-9]+$/) ? human(f["size"]) : "unknown size"
+      header = sprintf("  %s, %s, %s", f["format_long_name"], clock(f["duration"]), size)
+      if (rate(f["bit_rate"]) != "") header = header ", " rate(f["bit_rate"])
+      next
+    }
+    { i = index($0, "="); if (i) f[substr($0, 1, i - 1)] = substr($0, i + 1) }
+    END { print header; for (i = 1; i <= n; i++) print streams[i] }'
+done
+exit "$status"

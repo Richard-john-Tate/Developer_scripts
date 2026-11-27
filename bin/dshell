@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# dshell: open a shell in a running container, found by part of its name.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [NAME] [-- COMMAND [ARGS...]]
+
+Open an interactive shell inside a running container. Uses bash if the
+container has it, otherwise sh. Give a COMMAND after -- to run that
+instead of a shell.
+
+NAME can be part of the container's name (case doesn't matter) or the
+start of its ID, so "web" finds "myapp-web-1". An exact name always wins.
+If several containers match, they're listed so you can be more specific.
+With no NAME, the only running container is used.
+
+Options:
+  -u, --user USER     run as USER, e.g. root
+  -w, --workdir DIR   start in DIR inside the container
+  -h, --help          show this help
+
+Set DOCKER=podman (or any docker-compatible command) to use that instead.
+
+Examples:
+  $PROG web
+  $PROG -u root api
+  $PROG db -- psql -U postgres
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+docker=${DOCKER:-docker}
+user='' workdir='' name=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -u|--user)    [ $# -ge 2 ] || usage_error "$1 needs a value"; user=$2; shift ;;
+    -w|--workdir) [ $# -ge 2 ] || usage_error "$1 needs a value"; workdir=$2; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; break ;;
+    -*)           usage_error "unknown option: $1" ;;
+    *)            [ -z "$name" ] || usage_error "put the command after --, e.g. $PROG $name -- ls"
+                  name=$1 ;;
+  esac
+  shift
+done
+# Whatever is left in "$@" is the command to run.
+
+command -v "$docker" >/dev/null 2>&1 || die "'$docker' isn't installed (set DOCKER to use another command)"
+
+tab=$(printf '\t')
+err=$(mktemp "${TMPDIR:-/tmp}/dshell.XXXXXX")
+trap 'rm -f "$err"' EXIT
+running=$("$docker" ps --format "{{.ID}}$tab{{.Names}}" 2>"$err") || die "$(tail -n 1 "$err")"
+rm -f "$err"
+trap - EXIT
+
+# Print the names of containers matching $1 in "ID<TAB>NAME" lines on stdin:
+# just the exact match if there is one, else every partial match.
+matches() {
+  awk -F'\t' -v w="$1" '
+    NF < 2 { next }
+    $2 == w || $1 == w { print $2; exact = 1; exit }
+    index(tolower($2), tolower(w)) || index($1, tolower(w)) == 1 { m[++n] = $2 }
+    END { if (!exact) for (i = 1; i <= n; i++) print m[i] }'
+}
+
+if [ -n "$name" ]; then
+  found=$(printf '%s\n' "$running" | matches "$name")
+  [ -n "$found" ] || die "no running container matches '$name' (see: dps)"
+else
+  found=$(printf '%s\n' "$running" | awk -F'\t' 'NF >= 2 { print $2 }')
+  [ -n "$found" ] || die "no containers are running"
+fi
+
+case $found in
+  *"
+"*)
+    if [ -n "$name" ]; then
+      printf '%s: several running containers match '\''%s'\'':\n' "$PROG" "$name" >&2
+    else
+      printf '%s: several containers are running; say which one:\n' "$PROG" >&2
+    fi
+    printf '%s\n' "$found" | sed 's/^/  /' >&2
+    exit 1 ;;
+esac
+container=$found
+
+# -t only when there's a terminal to attach; -i so piped input still works.
+if [ -t 0 ]; then flags=(-it); else flags=(-i); fi
+[ -z "$user" ] || flags+=(-u "$user")
+[ -z "$workdir" ] || flags+=(-w "$workdir")
+
+if [ $# -gt 0 ]; then
+  exec "$docker" exec "${flags[@]}" "$container" "$@"
+fi
+printf '%s: opening a shell in %s\n' "$PROG" "$container" >&2
+exec "$docker" exec "${flags[@]}" "$container" \
+  sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'

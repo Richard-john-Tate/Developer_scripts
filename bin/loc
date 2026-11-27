@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# loc: count lines of code, grouped by file type.
+#
+set -euo pipefail
+unset CDPATH   # so "cd dir" never jumps somewhere else
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [DIR]
+
+Count files and lines under DIR (default: the current directory), grouped
+by file extension, biggest first. Scripts without an extension are grouped
+by their #! line ("bash script", "python3 script"). Binary and empty files
+are skipped.
+
+Inside a git repository only tracked files are counted, so dependencies
+and build output in .gitignore don't skew the numbers. Elsewhere, common
+dependency and build folders (node_modules, vendor, dist, ...) are skipped.
+
+Options:
+  -n, --count N  show only the top N file types
+  -h, --help     show this help
+
+(Lines are physical lines, blank lines and comments included. For a
+language-aware count, try tokei, scc or cloc.)
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+top=0 dir=.
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--count) [ $# -ge 2 ] || usage_error "$1 needs a value"; top=$2; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         usage_error "unknown option: $1" ;;
+    *)          dir=$1 ;;
+  esac
+  shift
+done
+case $top in ''|*[!0-9]*) usage_error "--count must be a whole number" ;; esac
+[ -d "$dir" ] || die "not a directory: $dir"
+cd -- "$dir"
+
+list=$(mktemp "${TMPDIR:-/tmp}/loc.XXXXXX")
+trap 'rm -f "$list"' EXIT
+
+# NUL-separated list of files to count.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git ls-files -z >"$list"
+else
+  find . \( -name .git -o -name node_modules -o -name vendor -o -name dist \
+       -o -name build -o -name target -o -name .venv -o -name venv \
+       -o -name __pycache__ -o -name .next -o -name coverage \) -prune \
+       -o -type f -print0 >"$list"
+fi
+[ -s "$list" ] || { echo "No files to count."; exit 0; }
+
+# First keep only non-empty text files (grep -I -l lists files with at least
+# one line, treating binary files as having none), then count their lines.
+# grep -c '' counts a last line without a newline too; -H always prints
+# "file:count"; -s hides errors for tracked files that were deleted or are
+# submodules. grep exits 1 when a batch has nothing to match: that's fine.
+{ xargs -0 grep -I -l --null -s '' <"$list" || true; } |
+  { xargs -0 grep -H -c '' || true; } |
+  awk '
+    # Files with no extension: group scripts by their #! interpreter
+    # ("bash script"), and keep names like Makefile and Dockerfile as is.
+    function script_type(path, name,   first, n, w, i, interp) {
+      if ((getline first < path) > 0 && first ~ /^#!/) {
+        n = split(substr(first, 3), w, " ")
+        interp = w[1]; sub(/.*\//, "", interp)
+        if (interp == "env")
+          for (i = 2; i <= n; i++) if (w[i] !~ /^-/) { interp = w[i]; break }
+        close(path)
+        if (interp != "" && interp != "env") return interp " script"
+      }
+      close(path)
+      return name
+    }
+    {
+      # Split on the last ":" since file names may contain colons.
+      i = length($0)
+      while (i > 0 && substr($0, i, 1) != ":") i--
+      path = substr($0, 1, i - 1); n = substr($0, i + 1) + 0
+      if (path == "(standard input)") next   # xargs ran grep with no files
+      name = path; sub(/.*\//, "", name)
+      if (name ~ /^\.[^.]*$/ || name !~ /\./) ext = script_type(path, name)
+      else { ext = name; sub(/.*\./, ".", ext); ext = tolower(ext) }
+      files[ext]++; lines[ext] += n
+    }
+    END { for (e in files) printf "%d\t%d\t%s\n", lines[e], files[e], e }
+  ' |
+  sort -t "$(printf '\t')" -k1,1nr -k3,3 |
+  {
+    printf '%-20s %8s %10s\n' TYPE FILES LINES
+    total_f=0 total_l=0 shown=0
+    while IFS=$'\t' read -r l f e; do
+      total_f=$((total_f + f)); total_l=$((total_l + l))
+      if [ "$top" -eq 0 ] || [ "$shown" -lt "$top" ]; then
+        printf '%-20s %8d %10d\n' "$e" "$f" "$l"
+        shown=$((shown + 1))
+      fi
+    done
+    printf '%-20s %8d %10d\n' TOTAL "$total_f" "$total_l"
+  }

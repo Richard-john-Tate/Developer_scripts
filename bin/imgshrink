@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+#
+# imgshrink: make images smaller for the web.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] IMAGE...
+
+Optimise each IMAGE for websites, chat and email, and save it as
+NAME.small.EXT next to the original. For each image it:
+
+  - turns photos upright (using their EXIF orientation);
+  - shrinks it so the longest side is at most 2048 pixels;
+  - removes metadata: EXIF (including the GPS location where a photo was
+    taken, and the camera's serial number), XMP and comments. The colour
+    profile is kept so colours don't shift;
+  - re-compresses it: JPEG at quality 82 (progressive), WebP at 80, PNG
+    at maximum compression.
+
+HEIC and other formats ImageMagick can read but not write become JPEG.
+
+Options:
+  -m, --max PX       longest side in pixels (default: 2048; 0 = keep the
+                     size)
+  -q, --quality N    JPEG/WebP quality, 1-100 (default: 82 JPEG, 80 WebP)
+      --keep-metadata  keep EXIF, XMP and comments
+  -o, --output FILE  where to write (only with a single IMAGE)
+  -f, --force        overwrite output files that already exist
+  -h, --help         show this help
+
+Examples:
+  $PROG IMG_2041.jpg
+  $PROG -m 1200 photos/*.jpg
+  $PROG -q 70 -o hero.webp hero-original.webp
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+max=2048 quality='' keep=0 output='' force=0 inputs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -m|--max)        [ $# -ge 2 ] || usage_error "$1 needs a value"; max=$2; shift ;;
+    -q|--quality)    [ $# -ge 2 ] || usage_error "$1 needs a value"; quality=$2; shift ;;
+    --keep-metadata) keep=1 ;;
+    -o|--output)     [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)      force=1 ;;
+    -h|--help)       usage; exit 0 ;;
+    --)              shift; inputs+=("$@"); break ;;
+    -*)              usage_error "unknown option: $1" ;;
+    *)               inputs+=("$1") ;;
+  esac
+  shift
+done
+[ ${#inputs[@]} -gt 0 ] || usage_error "give at least one image"
+[ -z "$output" ] || [ ${#inputs[@]} -eq 1 ] || usage_error "--output only works with a single image"
+case $max in ''|*[!0-9]*) usage_error "--max must be a whole number of pixels (0 to keep the size)" ;; esac
+if [ -n "$quality" ]; then
+  case $quality in *[!0-9]*|0) usage_error "--quality must be a number from 1 to 100" ;; esac
+  [ "$quality" -le 100 ] || usage_error "--quality must be a number from 1 to 100"
+fi
+
+# ImageMagick 7 is one "magick" command; version 6 has "convert".
+if have magick; then
+  IM=(magick)
+elif have convert; then
+  IM=(convert)
+else
+  die "needs ImageMagick (macOS: brew install imagemagick; Debian/Ubuntu: sudo apt install imagemagick)"
+fi
+
+# What this ImageMagick can do with a format: "rw+" for JPEG, "r--" for a
+# read-only one like HEIC, nothing if it doesn't know it.
+FORMATS=$("${IM[@]}" -list format 2>/dev/null || true)
+format_mode() {
+  printf '%s\n' "$FORMATS" | awk -v want="$1" '
+    { name = toupper($1); sub(/\*$/, "", name) }
+    name == want && mode == "" { for (i = 2; i <= NF; i++) if ($i ~ /^[r-][w-][+-]$/) { mode = $i; break } }
+    END { print mode }'
+}
+# ImageMagick's name for the format a file extension stands for.
+format_of() {
+  case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') in
+    jpg|jpeg|jpe) echo JPEG ;;
+    tif|tiff)     echo TIFF ;;
+    heic|heif)    echo HEIC ;;
+    *)            printf '%s' "$1" | tr '[:lower:]' '[:upper:]' ;;
+  esac
+}
+
+# Work out every output first, so nothing is written if any would fail.
+outputs=()
+for input in "${inputs[@]}"; do
+  [ -f "$input" ] || die "no such file: $input"
+  dir=$(dirname -- "$input") base=$(basename -- "$input") ext=''
+  case $base in ?*.*) ext=${base##*.}; base=${base%.*} ;; esac
+  if [ -n "$output" ]; then
+    out=$output
+  else
+    # No extension, or one this ImageMagick can't write (HEIC): use JPEG.
+    case $ext in
+      '') ext=jpg ;;
+      *)  case $(format_mode "$(format_of "$ext")") in ?w?) ;; *) ext=jpg ;; esac ;;
+    esac
+    out=$base.small.$ext
+    [ "$dir" = . ] || out=$dir/$out
+  fi
+  case $out in -*) out=./$out ;; esac
+  case $out in
+    *.*) case $(format_mode "$(format_of "${out##*.}")") in
+           ?w?) ;;
+           *) die "$out: this ImageMagick can't write .${out##*.} files" ;;
+         esac ;;
+    *) die "$out needs a file extension such as .jpg or .png" ;;
+  esac
+  if [ -e "$out" ]; then
+    [ ! "$out" -ef "$input" ] || die "the output can't be the input file ($out)"
+    [ "$force" -eq 1 ] || die "$out already exists (use --force to overwrite)"
+  fi
+  outputs+=("$out")
+done
+
+human() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u, " ")
+  for (i = 1; b >= 1024 && i < 5; i++) b /= 1024
+  fmt = (i == 1) ? "%d %s" : "%.1f %s"; printf fmt, b, u[i] }'; }
+filesize() { wc -c <"$1" | tr -d ' '; }
+
+partial=''
+trap '[ -z "$partial" ] || rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+status=0
+i=0
+for input in "${inputs[@]}"; do
+  out=${outputs[$i]}
+  i=$((i + 1))
+  case $input in -*) input=./$input ;; esac
+  format=$(format_of "${out##*.}")
+
+  # GIFs keep their animation; other formats take the first frame, or
+  # ImageMagick would write name-0.jpg, name-1.jpg, ...
+  if [ "$format" = GIF ]; then
+    set -- "$input" -coalesce
+  else
+    set -- "${input}[0]"
+  fi
+  set -- "$@" -auto-orient
+  [ "$max" -eq 0 ] || set -- "$@" -resize "${max}x${max}>"   # ">": only ever shrink
+  if [ "$keep" -eq 0 ]; then
+    # Drop every profile except the colour (ICC) one, and the comment.
+    set -- "$@" +profile '!icc,*' +set comment
+  fi
+  case $format in
+    JPEG) set -- "$@" -background white -alpha remove -alpha off \
+            -quality "${quality:-82}" -interlace Plane -sampling-factor 4:2:0 ;;
+    WEBP) set -- "$@" -quality "${quality:-80}" -define webp:method=6 ;;
+    PNG)  set -- "$@" -define png:compression-level=9
+          # PNG keeps text, dates and EXIF in chunks of their own.
+          [ "$keep" -eq 1 ] || set -- "$@" -define png:exclude-chunks=date,tIME,zTXt,tEXt,iTXt,eXIf ;;
+    GIF)  set -- "$@" -layers Optimize ;;
+    TIFF) set -- "$@" -compress zip ;;
+  esac
+
+  partial=$(dirname -- "$out")/.$(basename -- "$out").partial.$$.${out##*.}
+  # The FORMAT: prefix makes ImageMagick write that format whatever the
+  # temporary file is called.
+  if "${IM[@]}" "$@" "$format:$partial" && [ -s "$partial" ]; then
+    mv -f "$partial" "$out"
+    before=$(filesize "$input") after=$(filesize "$out")
+    note=''
+    [ "$after" -lt "$before" ] || note='; no smaller: the original was already well compressed'
+    printf '%s -> %s\n  %s -> %s (%d%% of the original%s)\n' "$input" "$out" \
+      "$(human "$before")" "$(human "$after")" "$(( before > 0 ? after * 100 / before : 0 ))" "$note"
+  else
+    rm -f "$partial"
+    printf '%s: failed to shrink %s\n' "$PROG" "$input" >&2
+    status=1
+  fi
+  partial=''
+done
+exit "$status"

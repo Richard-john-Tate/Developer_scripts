@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+#
+# fftrim: cut a clip out of a video or audio file.
+#
+set -euo pipefail
+export LC_NUMERIC=C
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] FILE START [END]
+
+Cut the part of FILE from START to END (default: the end of the file) and
+save it as NAME.clip.EXT next to the original.
+
+Times are seconds (90, 12.5) or [HH:]MM:SS (1:30, 01:02:03.5). Write
+END as +SECONDS to give a length instead: "1:00 +30" is a 30-second clip.
+
+By default nothing is re-encoded, so it's instant and loses no quality.
+But a cut can only start on a keyframe, so the clip may begin up to a few
+seconds before START. Use --exact for a frame-accurate cut; that
+re-encodes, which takes longer.
+
+Options:
+  -e, --exact        cut at exactly START (re-encodes)
+  -o, --output FILE  where to write (default: NAME.clip.EXT)
+  -f, --force        overwrite the output if it already exists
+  -h, --help         show this help
+
+Examples:
+  $PROG talk.mp4 12:30 15:00
+  $PROG -e interview.mov 0:42 +20 -o quote.mov
+  $PROG podcast.mp3 1:02:00
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+exact=0 output='' force=0 args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -e|--exact)  exact=1 ;;
+    -o|--output) [ $# -ge 2 ] || usage_error "$1 needs a value"; output=$2; shift ;;
+    -f|--force)  force=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    --)          shift; args+=("$@"); break ;;
+    -[0-9]*)     usage_error "times can't be negative: $1" ;;
+    -*)          usage_error "unknown option: $1" ;;
+    *)           args+=("$1") ;;
+  esac
+  shift
+done
+[ ${#args[@]} -ge 2 ] || usage_error "give a FILE and a START time"
+[ ${#args[@]} -le 3 ] || usage_error "too many arguments"
+input=${args[0]} start_arg=${args[1]} end_arg=${args[2]:-}
+
+# Seconds from "90", "12.5", "1:30" or "01:02:03.5"; fails on anything else.
+to_seconds() {
+  printf '%s\n' "$1" | awk -F: '
+    NF < 1 || NF > 3 { exit 1 }
+    { for (i = 1; i <= NF; i++) if ($i !~ /^([0-9]+\.?[0-9]*|\.[0-9]+)$/) exit 1
+      s = 0; for (i = 1; i <= NF; i++) s = s * 60 + $i
+      printf "%.3f\n", s }'
+}
+
+[ -f "$input" ] || die "no such file: $input"
+{ have ffmpeg && have ffprobe; } || die "needs ffmpeg (macOS: brew install ffmpeg; Debian/Ubuntu: sudo apt install ffmpeg)"
+
+start=$(to_seconds "$start_arg") || usage_error "bad START time '$start_arg' (use seconds or [HH:]MM:SS)"
+length=''
+if [ -n "$end_arg" ]; then
+  case $end_arg in
+    +*) length=$(to_seconds "${end_arg#+}") || usage_error "bad length '$end_arg'" ;;
+    *)  end=$(to_seconds "$end_arg") || usage_error "bad END time '$end_arg' (use seconds or [HH:]MM:SS)"
+        length=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.3f", e - s }') ;;
+  esac
+  awk -v l="$length" 'BEGIN { exit !(l > 0) }' || usage_error "END must be after START"
+fi
+
+duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 -- "$input" 2>/dev/null || true)
+case $duration in
+  ''|*[!0-9.]*) ;;   # unknown length (e.g. a live stream dump): don't check
+  *) awk -v s="$start" -v d="$duration" 'BEGIN { exit !(s < d) }' ||
+       die "START ($start_arg) is past the end of $input ($(printf '%.1f' "$duration")s long)" ;;
+esac
+
+if [ -z "$output" ]; then
+  dir=$(dirname -- "$input") base=$(basename -- "$input") ext=''
+  case $base in ?*.*) ext=.${base##*.}; base=${base%.*} ;; esac
+  output=$base.clip$ext
+  [ "$dir" = . ] || output=$dir/$output
+fi
+case $input in -*) input=./$input ;; esac
+case $output in -*) output=./$output ;; esac
+if [ -e "$output" ]; then
+  [ ! "$output" -ef "$input" ] || die "the output can't be the input file"
+  [ "$force" -eq 1 ] || die "$output already exists (use --force to overwrite)"
+fi
+
+if [ "$exact" -eq 1 ]; then
+  # Re-encode with codecs that suit the output's container.
+  case $(printf '%s' "${output##*.}" | tr '[:upper:]' '[:lower:]') in
+    mp4|m4v|mov|mkv) codecs=(-c:v libx264 -crf 18 -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k) ;;
+    webm)            codecs=(-c:v libvpx-vp9 -crf 30 -b:v 0 -c:a libopus) ;;
+    *)               codecs=() ;;   # let ffmpeg pick its defaults for this format
+  esac
+  # ${codecs[@]+...}: an empty array is an error under set -u in bash 3.2.
+  set -- -map '0:v?' -map '0:a?' ${codecs[@]+"${codecs[@]}"}
+else
+  # Copy every stream as-is; make_zero keeps timestamps sane in the new file.
+  set -- -map 0 -c copy -avoid_negative_ts make_zero
+fi
+[ -z "$length" ] || set -- -t "$length" "$@"
+
+stats=-nostats
+[ -t 2 ] && stats=-stats
+
+partial=$(dirname -- "$output")/.$(basename -- "$output").partial.$$.${output##*.}
+trap 'rm -f "$partial"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# -ss before -i seeks quickly; when re-encoding ffmpeg still cuts exactly.
+if ffmpeg -hide_banner -nostdin -loglevel error "$stats" -ss "$start" -i "$input" "$@" -y "$partial"; then
+  mv -f "$partial" "$output"
+  echo "$input -> $output"
+else
+  die "ffmpeg couldn't cut $input"
+fi

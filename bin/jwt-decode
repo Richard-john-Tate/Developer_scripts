@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""jwt-decode: show what's inside a JSON Web Token."""
+
+import argparse
+import base64
+import binascii
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+PROG = os.path.basename(sys.argv[0])
+
+HELP = f"""\
+Usage: {PROG} [options] [TOKEN]
+
+Decode a JSON Web Token (JWT) and show its header, its payload (the
+claims), and when it was issued and expires, with whether it has expired.
+
+If TOKEN isn't given it's read from standard input, which keeps it out of
+your shell history:  pbpaste | {PROG}   or   xclip -o | {PROG}
+A leading "Bearer " or "Authorization: Bearer " is ignored, so you can
+paste a whole header.
+
+This only DECODES the token. It does not check the signature, so it can't
+tell you whether the token is genuine. Never trust a token because it
+decodes.
+
+Options:
+  -p, --payload  print only the payload, as JSON (to pipe into jq etc.)
+  -e, --expired  exit with status 1 if the token has expired
+  -h, --help     show this help"""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f'{PROG}: {message}\nTry "{PROG} --help".\n')
+        sys.exit(2)
+
+
+class BadToken(Exception):
+    pass
+
+
+def b64url_json(part, what):
+    padded = part + "=" * (-len(part) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (binascii.Error, ValueError, UnicodeEncodeError):
+        raise BadToken(f"the {what} isn't valid base64url") from None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise BadToken(f"the {what} isn't JSON") from None
+
+
+def ago(seconds):
+    future = seconds > 0
+    s = abs(seconds)
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute"), (1, "second")):
+        if s >= size or size == 1:
+            n = int(s // size)
+            text = f"{n} {unit}{'' if n == 1 else 's'}"
+            return f"in {text}" if future else f"{text} ago"
+
+
+def when(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return f"{value!r} (not a timestamp)"
+    try:
+        moment = datetime.fromtimestamp(value, tz=timezone.utc).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return f"{value} (out of range)"
+    return f"{moment.strftime('%Y-%m-%d %H:%M:%S %Z')}  ({ago(value - time.time())})"
+
+
+def main():
+    parser = Parser(prog=PROG, add_help=False, allow_abbrev=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-p", "--payload", action="store_true")
+    parser.add_argument("-e", "--expired", action="store_true")
+    parser.add_argument("token", nargs="?")
+    args = parser.parse_args()
+    if args.help:
+        print(HELP)
+        return 0
+
+    token = args.token if args.token is not None else sys.stdin.read()
+    token = token.strip()
+    for prefix in ("Authorization:", "Bearer "):
+        if token.lower().startswith(prefix.lower()):
+            token = token[len(prefix):].strip()
+    if not token:
+        parser.error("no token given")
+
+    parts = token.split(".")
+    try:
+        if len(parts) == 5:
+            raise BadToken("this is an encrypted token (JWE); it can't be read without the key")
+        if len(parts) != 3:
+            raise BadToken(f"a JWT has 3 parts separated by dots; this has {len(parts)}")
+        header = b64url_json(parts[0], "header")
+        payload = b64url_json(parts[1], "payload")
+    except BadToken as err:
+        sys.stderr.write(f"{PROG}: not a valid JWT: {err}\n")
+        return 1
+
+    now = time.time()
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    expired = isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp <= now
+
+    if args.payload:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("Header:")
+        print(json.dumps(header, indent=2, ensure_ascii=False))
+        print("\nPayload:")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        if isinstance(payload, dict):
+            times = [(key, label) for key, label in
+                     (("iat", "issued"), ("nbf", "valid from"), ("exp", "expires"))
+                     if key in payload]
+            if times:
+                print("\nTimes:")
+                for key, label in times:
+                    print(f"  {label + ':':12} {when(payload[key])}")
+        if "exp" not in (payload if isinstance(payload, dict) else {}):
+            status = "never expires (no exp claim)"
+        elif expired:
+            status = "EXPIRED"
+        else:
+            status = "not expired"
+        print(f"\nStatus: {status}. Signature: not checked.")
+
+    return 1 if args.expired and expired else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # The reader went away (e.g. piped into head): stop quietly.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

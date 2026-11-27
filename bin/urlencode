@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""urlencode: percent-encode text for use in a URL."""
+
+import argparse
+import os
+import sys
+from urllib.parse import quote, quote_plus
+
+PROG = os.path.basename(sys.argv[0])
+
+HELP = f"""\
+Usage: {PROG} [options] [TEXT...]
+
+Percent-encode each TEXT so it's safe inside a URL: spaces, &, =, /, ?,
+# and non-ASCII characters become %XX codes. With no TEXT, each line of
+standard input is encoded.
+
+Only letters, digits and - . _ ~ are left as they are.
+
+Options:
+  -f, --form   encode spaces as + (HTML form / query-string style)
+  -p, --path   leave / alone, for encoding a path rather than one value
+  -h, --help   show this help
+
+Examples:
+  {PROG} "café & crème"            # caf%C3%A9%20%26%20cr%C3%A8me
+  curl "https://example.com/search?q=$({PROG} -f 'big cats')"
+
+See also: urldecode"""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f'{PROG}: {message}\nTry "{PROG} --help".\n')
+        sys.exit(2)
+
+
+def main():
+    parser = Parser(prog=PROG, add_help=False, allow_abbrev=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-f", "--form", action="store_true")
+    parser.add_argument("-p", "--path", action="store_true")
+    parser.add_argument("text", nargs="*")
+    args = parser.parse_args()
+    if args.help:
+        print(HELP)
+        return 0
+
+    # Work on bytes, so text that isn't valid UTF-8 is still encoded byte by
+    # byte instead of crashing (Python keeps odd bytes in argv as surrogates).
+    safe = "/" if args.path else ""
+    encode = quote_plus if args.form else quote
+    if args.text:
+        lines = (t.encode("utf-8", "surrogateescape") for t in args.text)
+    else:
+        lines = (line.rstrip(b"\r\n") for line in sys.stdin.buffer)
+    for line in lines:
+        print(encode(line, safe=safe))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
