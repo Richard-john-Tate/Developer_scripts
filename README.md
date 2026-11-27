@@ -77,6 +77,18 @@ leaves a half-written file behind.
 | [`ffthumbs`](bin/ffthumbs) | A thumbnail, N evenly spaced frames, or a contact sheet (`-s 4x4`) of a whole video. |
 | [`ffconcat`](bin/ffconcat) | Join clips end to end, losslessly when they match, or with `-r` for any mix of sizes and formats. |
 
+### Docker
+
+All four also work with podman (or any docker-compatible tool): set
+`DOCKER=podman`.
+
+| Command | What it does |
+| --- | --- |
+| [`dps`](bin/dps) | A compact `docker ps`: name, image, status and tidy ports like `8080->80`. `-a` adds stopped containers; a NAME filters. |
+| [`dshell`](bin/dshell) | Open a shell (bash, else sh) in a running container found by part of its name. `-- CMD` runs a command instead. |
+| [`dlogs`](bin/dlogs) | Show and follow a container's logs by part of its name. Works on stopped containers too, so you can see why one crashed. |
+| [`docker-clean`](bin/docker-clean) | Show Docker's disk use and exactly what would go, then remove stopped containers, dangling images, unused networks and build cache. `-a` for all unused images, `--volumes` for volumes (with a data-loss warning). |
+
 ### Data and text
 
 | Command | What it does |
@@ -145,6 +157,12 @@ ffgif -s 1:05 -t 4 -w 320 match.mp4 goal.gif
 ffaudio -t mp3 lecture.mp4
 ffthumbs -s 4x4 lecture.mp4      # contact sheet of the whole video
 ffconcat part1.mp4 part2.mp4 part3.mp4
+
+# Docker
+dps                              # what's running, on which ports?
+dshell db -- psql -U postgres    # run psql in the container whose name has "db"
+dlogs -n 50 api                  # follow the api container's logs
+docker-clean -n                  # how much space would I get back?
 
 # Data and text
 curl -s https://api.github.com/repos/git/git | jsonfmt

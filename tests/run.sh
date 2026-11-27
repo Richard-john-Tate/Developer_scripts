@@ -1227,6 +1227,282 @@ test_csvview_aligns_tricky_csv() {
   expect_status 1
 }
 
+# --- docker scripts ---------------------------------------------------------
+#
+# These use a fake "docker" command, so they need no Docker daemon. It logs
+# every call to $FAKE_DOCKER/calls.log and answers from files there:
+#   containers.tsv  ID, NAME, IMAGE, STATUS, PORTS, IMAGE-ID, VOLUMES
+#                   (running = "Up..."; VOLUMES = mounted volume names, comma-separated)
+#   images.tsv      ID, REPOSITORY:TAG, SIZE, dangling (yes/no)
+#   volumes.tsv     names of all volumes
+# Touch $FAKE_DOCKER/down to make it act as if the daemon isn't running.
+
+fake_docker() {
+  export FAKE_DOCKER=$PWD/fake
+  mkdir -p "$FAKE_DOCKER" fakebin
+  : >"$FAKE_DOCKER/calls.log"
+  cat >fakebin/docker <<'STUB'
+#!/usr/bin/env bash
+d=$FAKE_DOCKER
+me=$(basename "$0")
+printf '%s %s\n' "$me" "$*" >>"$d/calls.log"
+if [ -e "$d/down" ]; then
+  echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+  exit 1
+fi
+fmt='' all=0 dangling=0
+for a in "$@"; do
+  case $prev in --format) fmt=$a ;; esac
+  case $a in --all|-a) all=1 ;; dangling=true) dangling=1 ;; esac
+  prev=$a
+done
+# Fill in {{.Key}} placeholders in $fmt from tab-separated records on stdin.
+render() {
+  awk -F'\t' -v fmt="$1" -v keys="$2" '
+    BEGIN { nk = split(keys, k, " ") }
+    { s = fmt; for (i = 1; i <= nk; i++) gsub("\\{\\{\\." k[i] "\\}\\}", $i, s); print s }'
+}
+case "$1 ${2:-}" in
+  "ps "*)
+    awk -F'\t' -v all="$all" 'all || $4 ~ /^Up/' "$d/containers.tsv" |
+      render "$fmt" "ID Names Image Status Ports ImageID" ;;
+  "inspect "*)
+    shift 3   # inspect --format FORMAT
+    case $fmt in
+      *.Mounts*)   # one mounted volume name per line
+        for id in "$@"; do awk -F'\t' -v id="$id" '$1 == id { n = split($7, v, ","); for (i = 1; i <= n; i++) print v[i] }' "$d/containers.tsv"; done ;;
+      *)
+        for id in "$@"; do awk -F'\t' -v id="$id" '$1 == id' "$d/containers.tsv"; done |
+          render "$fmt" "ID Names ImageName Status Ports Image" ;;
+    esac ;;
+  "images "*)
+    awk -F'\t' -v dangling="$dangling" '!dangling || $4 == "yes"' "$d/images.tsv" |
+      render "${fmt//\{\{.Repository\}\}:\{\{.Tag\}\}/\{\{.RepoTag\}\}}" "ID RepoTag Size" ;;
+  "volume ls") cat "$d/volumes.tsv" ;;
+  "system df") printf 'TYPE   TOTAL   ACTIVE   SIZE   RECLAIMABLE\nImages 3 1 1GB 600MB (60%%)\n' ;;
+  "builder prune")
+    if [ "$me" = podman ]; then echo "Error: unknown command \"builder\" for \"podman\"" >&2; exit 125; fi
+    case " $* " in *" --help "*) echo "Usage: docker builder prune" ;; *) echo "Total:	0B" ;; esac ;;
+  "volume prune")
+    case " $* " in
+      *" --help "*) if [ "$me" = podman ]; then echo "  -f, --force"; else echo "  -a, --all   Remove all unused volumes"; fi ;;
+      *) echo "Total reclaimed space: 5GB" ;;
+    esac ;;
+  *" prune") echo "Total reclaimed space: 1MB" ;;
+  "exec "*|"logs "*) echo "ran: $me $*" ;;
+  *) echo "fake docker: unexpected command: $*" >&2; exit 99 ;;
+esac
+STUB
+  chmod +x fakebin/docker
+  cp fakebin/docker fakebin/podman
+  export PATH="$PWD/fakebin:$PATH"
+  unset DOCKER
+  tab=$(printf '\t')
+  # Two running containers with similar names, one stopped, one crashed.
+  cat >"$FAKE_DOCKER/containers.tsv" <<EOF
+aaa111${tab}shop-web-1${tab}shop/web:latest${tab}Up 2 hours${tab}0.0.0.0:8080->80/tcp, [::]:8080->80/tcp${tab}sha256:img-web
+bbb222${tab}shop-web-admin${tab}shop/admin:2.1${tab}Up 5 minutes (healthy)${tab}127.0.0.1:9000->9000/tcp, 9001/tcp${tab}sha256:img-admin
+ccc333${tab}shop-db-1${tab}postgres:16${tab}Up 2 hours${tab}5432/tcp${tab}sha256:img-pg${tab}pgdata
+ddd444${tab}old-migration${tab}shop/web:latest${tab}Exited (0) 3 days ago${tab}${tab}sha256:img-web${tab}migrations-cache
+eee555${tab}crashed-worker${tab}shop/worker:1.0${tab}Exited (1) 10 minutes ago${tab}${tab}sha256:img-worker
+EOF
+  cat >"$FAKE_DOCKER/images.tsv" <<EOF
+sha256:img-web${tab}shop/web:latest${tab}210MB${tab}no
+sha256:img-admin${tab}shop/admin:2.1${tab}180MB${tab}no
+sha256:img-pg${tab}postgres:16${tab}430MB${tab}no
+sha256:img-worker${tab}shop/worker:1.0${tab}95MB${tab}no
+sha256:img-old${tab}<none>:<none>${tab}205MB${tab}yes
+EOF
+  printf 'pgdata\npgdata-old\nmigrations-cache\n' >"$FAKE_DOCKER/volumes.tsv"
+}
+calls() { cat "$FAKE_DOCKER/calls.log"; }
+
+test_dps_tidies_ports_and_filters() {
+  fake_docker
+  run dps
+  expect_status 0
+  expect_out "shop-web-1"
+  expect_out "8080->80"
+  expect_no_out "0.0.0.0"
+  expect_no_out "[::]"
+  expect_out "127.0.0.1:9000->9000, 9001/tcp"
+  expect_no_out "old-migration"
+
+  run dps -a migration
+  expect_status 0
+  expect_out "old-migration"
+  expect_no_out "shop-web-1"
+
+  run dps nothing-like-this
+  expect_status 1
+  expect_out 'No running containers match "nothing-like-this"'
+}
+
+test_dps_daemon_down() {
+  fake_docker
+  touch "$FAKE_DOCKER/down"
+  run dps
+  expect_status 1
+  expect_out "Cannot connect to the Docker daemon"
+}
+
+test_dshell_matching_rules() {
+  fake_docker
+  # An exact name wins even though "shop-web-admin" also contains it.
+  run dshell shop-web-1 -- ls /
+  expect_status 0
+  expect_out "ran: docker exec -i shop-web-1 ls /"
+
+  # One partial match (case-insensitive) is used; ID prefixes work too.
+  run dshell ADMIN -- true
+  expect_out "exec -i shop-web-admin true"
+  run dshell ccc -- true
+  expect_out "exec -i shop-db-1 true"
+
+  # Several matches: list them, run nothing.
+  : >"$FAKE_DOCKER/calls.log"
+  run dshell web
+  expect_status 1
+  expect_out "several running containers match 'web'"
+  expect_out "  shop-web-1"
+  expect_out "  shop-web-admin"
+  calls | grep -q ' exec ' && fail "ran exec despite an ambiguous name"
+
+  # Stopped containers aren't candidates.
+  run dshell migration
+  expect_status 1
+  expect_out "no running container matches"
+}
+
+test_dshell_shell_fallback_and_flags() {
+  fake_docker
+  run dshell -u root -w /app db
+  expect_status 0
+  expect_out "exec -i -u root -w /app shop-db-1 sh -c"
+  expect_out "command -v bash"
+  run dshell
+  expect_status 1
+  expect_out "several containers are running"
+  run dshell db extra
+  expect_status 2
+}
+
+test_dshell_only_container() {
+  fake_docker
+  awk -F'\t' '$2 == "shop-db-1" || $4 !~ /^Up/' "$FAKE_DOCKER/containers.tsv" >c && mv c "$FAKE_DOCKER/containers.tsv"
+  run dshell -- whoami
+  expect_status 0
+  expect_out "exec -i shop-db-1 whoami"
+}
+
+test_dlogs_follow_and_options() {
+  fake_docker
+  run dlogs db
+  expect_status 0
+  expect_out "ran: docker logs --tail 100 --follow shop-db-1"
+  run dlogs -n 5 -s 10m -t -F admin
+  expect_out "ran: docker logs --tail 5 --since 10m --timestamps shop-web-admin"
+  run dlogs -n all -F db
+  expect_out "logs --tail all shop-db-1"
+}
+
+test_dlogs_falls_back_to_stopped_containers() {
+  fake_docker
+  run dlogs worker
+  expect_status 0
+  expect_out "crashed-worker is not running"
+  expect_out "ran: docker logs --tail 100 crashed-worker"
+  expect_no_out "--follow"
+  # A running match is preferred over a stopped one.
+  run dlogs shop-web
+  expect_status 1
+  expect_out "several running containers"
+  run dlogs
+  expect_status 2
+  run dlogs -n lots db
+  expect_status 2
+}
+
+test_docker_clean_dry_run_lists_and_removes_nothing() {
+  fake_docker
+  run docker-clean -n
+  expect_status 0
+  expect_out "Stopped containers (2):"
+  expect_out "old-migration"
+  expect_out "crashed-worker"
+  expect_no_out "  shop-db-1"
+  expect_out "Dangling images (1):"
+  expect_out "<none>:<none>  (img-old"
+  expect_out "dry run"
+  calls | grep -q prune && fail "dry run called prune"
+  return 0
+}
+
+test_docker_clean_all_skips_images_in_use() {
+  fake_docker
+  run docker-clean -a -n
+  expect_status 0
+  expect_out "Unused images (2):"
+  expect_out "shop/worker:1.0"   # only its stopped container used it
+  expect_out "<none>:<none>"
+  expect_no_out "postgres:16  ("
+  expect_no_out "shop/web:latest  ("
+}
+
+test_docker_clean_runs_prunes_in_order() {
+  fake_docker
+  run docker-clean -y
+  expect_status 0
+  expect_out "Total reclaimed space"
+  [ "$(calls | grep prune | grep -v -- --help)" = "docker container prune --force
+docker image prune --force
+docker network prune --force
+docker builder prune --force" ] || fail "unexpected prune calls: $(calls | grep prune)"
+  calls | grep -q 'volume prune' && fail "pruned volumes without --volumes"
+
+  : >"$FAKE_DOCKER/calls.log"
+  run docker-clean -ay --volumes
+  expect_status 0
+  expect_out "WARNING: the volumes above will be deleted"
+  expect_out "pgdata-old"
+  calls | grep -q '^docker image prune --all --force$' || fail "--all not passed to image prune"
+  calls | grep -q '^docker volume prune --all --force$' || fail "volumes not pruned with --all"
+}
+
+test_docker_clean_volume_preview_includes_stopped_containers() {
+  fake_docker
+  # migrations-cache belongs to a *stopped* container. That container is
+  # removed first, so its volume goes too: the preview must list it.
+  run docker-clean -n --volumes
+  expect_status 0
+  expect_out "Volumes no running container uses (2)"
+  expect_out "pgdata-old"
+  expect_out "migrations-cache"
+  printf '%s\n' "$out" | grep -qx '  pgdata' && fail "listed a volume a running container uses"
+  calls | grep -q 'prune' && fail "dry run pruned something"
+  true
+}
+
+test_docker_clean_needs_yes_without_tty() {
+  fake_docker
+  run docker-clean </dev/null
+  expect_status 1
+  expect_out "--yes"
+  calls | grep -q prune && fail "pruned without confirmation"
+  return 0
+}
+
+test_docker_scripts_use_podman_when_asked() {
+  fake_docker
+  run env DOCKER=podman docker-clean -y --volumes
+  expect_status 0
+  calls | grep -q '^docker ' && fail "called docker instead of podman"
+  calls | grep -q '^podman builder prune --force' && fail "tried to prune a build cache podman doesn't have"
+  calls | grep -q '^podman volume prune --force$' || fail "podman volumes not pruned with its own flags"
+  run env DOCKER=podman dshell db -- true
+  expect_out "ran: podman exec -i shop-db-1 true"
+}
+
 # --- runner -----------------------------------------------------------------
 
 filter=${1:-}

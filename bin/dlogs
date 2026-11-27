@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#
+# dlogs: follow a container's logs, found by part of its name.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] NAME
+
+Show the last lines of a container's logs, then keep printing new ones
+until you press Ctrl-C.
+
+NAME can be part of the container's name (case doesn't matter) or the
+start of its ID, so "web" finds "myapp-web-1". An exact name always wins.
+Running containers are searched first, then stopped ones, so you can
+read the logs of a container that crashed. If several match, they're
+listed so you can be more specific.
+
+Options:
+  -n, --lines N      start with the last N lines (default: 100; "all" for
+                     everything)
+  -s, --since TIME   only show logs since TIME: a duration like 10m or 2h,
+                     or a date like 2026-11-27T09:00
+  -F, --no-follow    print the logs and exit instead of following them
+  -t, --timestamps   show when each line was written
+  -h, --help         show this help
+
+Set DOCKER=podman (or any docker-compatible command) to use that instead.
+
+Examples:
+  $PROG web
+  $PROG -n 20 -F worker
+  $PROG -s 10m -t api
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+docker=${DOCKER:-docker}
+lines=100 since='' follow=1 timestamps=0 name=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--lines)      [ $# -ge 2 ] || usage_error "$1 needs a value"; lines=$2; shift ;;
+    -s|--since)      [ $# -ge 2 ] || usage_error "$1 needs a value"; since=$2; shift ;;
+    -F|--no-follow)  follow=0 ;;
+    -t|--timestamps) timestamps=1 ;;
+    -h|--help)       usage; exit 0 ;;
+    --)              shift; [ $# -le 1 ] || usage_error "give one NAME"; name=${1:-}; break ;;
+    -*)              usage_error "unknown option: $1" ;;
+    *)               [ -z "$name" ] || usage_error "give one NAME"; name=$1 ;;
+  esac
+  shift
+done
+[ -n "$name" ] || usage_error "say which container (part of its name is enough)"
+case $lines in all) ;; ''|*[!0-9]*) usage_error "--lines must be a number or \"all\"" ;; esac
+
+command -v "$docker" >/dev/null 2>&1 || die "'$docker' isn't installed (set DOCKER to use another command)"
+
+tab=$(printf '\t')
+err=$(mktemp "${TMPDIR:-/tmp}/dlogs.XXXXXX")
+trap 'rm -f "$err"' EXIT
+
+# Print the names of containers matching $1 in "ID<TAB>NAME" lines on stdin:
+# just the exact match if there is one, else every partial match.
+matches() {
+  awk -F'\t' -v w="$1" '
+    NF < 2 { next }
+    $2 == w || $1 == w { print $2; exact = 1; exit }
+    index(tolower($2), tolower(w)) || index($1, tolower(w)) == 1 { m[++n] = $2 }
+    END { if (!exact) for (i = 1; i <= n; i++) print m[i] }'
+}
+
+running=$("$docker" ps --format "{{.ID}}$tab{{.Names}}" 2>"$err") || die "$(tail -n 1 "$err")"
+found=$(printf '%s\n' "$running" | matches "$name")
+where=running
+if [ -z "$found" ]; then
+  everything=$("$docker" ps --all --format "{{.ID}}$tab{{.Names}}" 2>"$err") || die "$(tail -n 1 "$err")"
+  found=$(printf '%s\n' "$everything" | matches "$name")
+  where=stopped
+fi
+[ -n "$found" ] || die "no container matches '$name' (see: dps -a)"
+
+case $found in
+  *"
+"*)
+    printf '%s: several %s containers match '\''%s'\'':\n' "$PROG" "$where" "$name" >&2
+    printf '%s\n' "$found" | sed 's/^/  /' >&2
+    exit 1 ;;
+esac
+
+set -- logs --tail "$lines"
+[ -z "$since" ] || set -- "$@" --since "$since"
+[ "$timestamps" -eq 0 ] || set -- "$@" --timestamps
+# Following a stopped container would just print and exit anyway.
+[ "$follow" -eq 0 ] || [ "$where" = stopped ] || set -- "$@" --follow
+
+if [ "$where" = stopped ]; then
+  printf '%s: %s is not running; showing its last logs\n' "$PROG" "$found" >&2
+fi
+rm -f "$err"
+trap - EXIT
+exec "$docker" "$@" "$found"

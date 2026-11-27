@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+#
+# docker-clean: reclaim disk space from Docker, showing what goes first.
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options]
+
+Free up disk space used by Docker. First shows how much space Docker uses
+and lists what would be removed, then asks before removing:
+
+  - stopped containers
+  - dangling images (untagged leftovers from rebuilds)
+  - networks no container uses
+  - build cache
+
+Running containers, and the images and volumes they use, are never
+touched.
+
+Options:
+  -a, --all       also remove every image no running container uses, not
+                  just dangling ones. They'll be downloaded or rebuilt
+                  again when needed
+      --volumes   also remove volumes no container uses. Volumes hold
+                  data such as databases; once removed it's gone for good
+  -n, --dry-run   list what would be removed, remove nothing
+  -y, --yes       don't ask for confirmation
+  -h, --help      show this help
+
+Set DOCKER=podman (or any docker-compatible command) to use that instead.
+
+Examples:
+  $PROG -n          # what would go?
+  $PROG             # tidy up, after confirming
+  $PROG -a -y       # also drop unused images, no questions
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+docker=${DOCKER:-docker}
+all=0 volumes=0 dry_run=0 yes=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -a|--all)     all=1 ;;
+    --volumes)    volumes=1 ;;
+    -n|--dry-run) dry_run=1 ;;
+    -y|--yes)     yes=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -[!-]?*)      rest=${1#-?}; flag=${1%"$rest"}; shift
+                  set -- "$flag" "-$rest" "$@"; continue ;;   # -ay -> -a -y
+    *)            usage_error "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+command -v "$docker" >/dev/null 2>&1 || die "'$docker' isn't installed (set DOCKER to use another command)"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  bold=$'\033[1m' red=$'\033[31m' reset=$'\033[0m'
+else
+  bold='' red='' reset=''
+fi
+
+tab=$(printf '\t')
+err=$(mktemp "${TMPDIR:-/tmp}/docker-clean.XXXXXX")
+trap 'rm -f "$err"' EXIT
+
+# Run a read-only docker command; on failure, die with docker's own message
+# (e.g. "Cannot connect to the Docker daemon").
+query() { "$docker" "$@" 2>"$err" || die "$(tail -n 1 "$err")"; }
+
+# Print up to 20 lines of stdin indented, then how many more there were.
+show() {
+  awk -v max=20 'NR <= max { print "  " $0 } END { if (NR > max) printf "  ... and %d more\n", NR - max }'
+}
+count() { if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l | tr -d ' '; fi; }
+
+echo "${bold}Docker disk usage now:${reset}"
+query system df
+echo
+
+# Stopped containers: everything not running, paused or restarting.
+stopped=$(query ps --all --format "{{.Names}}$tab{{.Image}}$tab{{.Status}}" |
+  awk -F'\t' '$3 ~ /^(Exited|Created|Dead|Stopped|Configured)/ { print $1 "  (" $2 ", " $3 ")" }')
+
+# Stopped containers are removed first, so what counts as "unused" below
+# is anything no *running* container uses.
+running=$(query ps --format '{{.ID}}')
+
+# Images to remove: dangling ones, or with --all every image that no
+# running container uses.
+if [ "$all" -eq 1 ]; then
+  image_kind="Unused images"
+  used=''
+  if [ -n "$running" ]; then
+    # shellcheck disable=SC2086  # one argument per container ID
+    used=$(query inspect --format '{{.Image}}' $running)
+  fi
+  images=$(query images --no-trunc --format "{{.ID}}$tab{{.Repository}}:{{.Tag}}$tab{{.Size}}" |
+    awk -F'\t' -v used="$used" '
+      BEGIN { n = split(used, u, "\n"); for (i = 1; i <= n; i++) { sub(/^sha256:/, "", u[i]); inuse[u[i]] = 1 } }
+      { id = $1; sub(/^sha256:/, "", id)
+        if (!(id in inuse) && !seen[id]++) print $2 "  (" substr(id, 1, 12) ", " $3 ")" }')
+else
+  image_kind="Dangling images"
+  images=$(query images --filter dangling=true --no-trunc --format "{{.ID}}$tab{{.Repository}}:{{.Tag}}$tab{{.Size}}" |
+    awk -F'\t' '{ id = $1; sub(/^sha256:/, "", id); if (!seen[id]++) print $2 "  (" substr(id, 1, 12) ", " $3 ")" }')
+fi
+
+# Volumes to remove: every volume no running container mounts. That
+# includes the volumes of stopped containers (a stopped database, say),
+# which become unused once those containers are removed, so they must be
+# shown here too, not just the ones that are unused already.
+vols=''
+if [ "$volumes" -eq 1 ]; then
+  mounted=''
+  if [ -n "$running" ]; then
+    # shellcheck disable=SC2086  # one argument per container ID
+    mounted=$(query inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{println}}{{end}}{{end}}' $running)
+  fi
+  vols=$(query volume ls --format '{{.Name}}' |
+    awk -v mounted="$mounted" '
+      BEGIN { n = split(mounted, m, "\n"); for (i = 1; i <= n; i++) if (m[i] != "") keep[m[i]] = 1 }
+      $0 != "" && !($0 in keep)')
+fi
+
+printf '%sStopped containers (%d):%s\n' "$bold" "$(count "$stopped")" "$reset"
+[ -z "$stopped" ] || printf '%s\n' "$stopped" | show
+printf '%s%s (%d):%s\n' "$bold" "$image_kind" "$(count "$images")" "$reset"
+[ -z "$images" ] || printf '%s\n' "$images" | show
+if [ "$volumes" -eq 1 ]; then
+  printf '%sVolumes no running container uses (%d):%s\n' "$bold" "$(count "$vols")" "$reset"
+  [ -z "$vols" ] || printf '%s\n' "$vols" | show
+fi
+echo "Unused networks and the build cache will be cleared too."
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "(dry run: nothing removed)"
+  exit 0
+fi
+
+if [ "$volumes" -eq 1 ] && [ -n "$vols" ]; then
+  printf '\n%sWARNING:%s the volumes above will be deleted with everything in them\n' "$red" "$reset"
+  printf '(database files, uploads, ...). This cannot be undone.\n'
+fi
+
+if [ "$yes" -eq 0 ]; then
+  [ -t 0 ] || die "not a terminal, so can't ask for confirmation; re-run with --yes"
+  printf '\nRemove all of this? [y/N] '
+  read -r reply || reply=''
+  case $reply in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
+fi
+
+# Run one prune step and report the space it freed.
+status=0
+step() {
+  local label=$1 out
+  shift
+  printf '==> %s\n' "$label"
+  if out=$("$docker" "$@" 2>&1); then
+    printf '%s\n' "$out" | awk '/[Rr]eclaimed/ { print "    " $0 }'
+  else
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    status=1
+  fi
+}
+
+echo
+step "Removing stopped containers" container prune --force
+if [ "$all" -eq 1 ]; then
+  step "Removing unused images" image prune --all --force
+else
+  step "Removing dangling images" image prune --force
+fi
+step "Removing unused networks" network prune --force
+# Not every docker-compatible tool has a build cache to prune (podman doesn't).
+if "$docker" builder prune --help >/dev/null 2>&1; then
+  step "Clearing the build cache" builder prune --force
+fi
+if [ "$volumes" -eq 1 ]; then
+  # Since Docker 23, "volume prune" only removes anonymous volumes unless
+  # given --all; older Docker and podman remove all unused ones anyway.
+  case $("$docker" volume prune --help 2>&1 || true) in
+    *--all*) step "Removing unused volumes" volume prune --all --force ;;
+    *)       step "Removing unused volumes" volume prune --force ;;
+  esac
+fi
+
+echo
+echo "${bold}Docker disk usage now:${reset}"
+"$docker" system df || true
+exit "$status"

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# dps: a compact, readable "docker ps".
+#
+set -euo pipefail
+
+readonly PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [NAME]
+
+List containers with just the columns you usually want: name, image,
+status and ports. Ports are tidied up: "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp"
+becomes "8080->80". Give NAME to show only containers whose name contains it.
+
+Options:
+  -a, --all   include stopped containers
+  -h, --help  show this help
+
+Set DOCKER=podman (or any docker-compatible command) to use that instead.
+
+Examples:
+  $PROG
+  $PROG -a web
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+docker=${DOCKER:-docker}
+all=0 filter=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -a|--all)  all=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        usage_error "unknown option: $1" ;;
+    *)         [ -z "$filter" ] || usage_error "give at most one NAME"; filter=$1 ;;
+  esac
+  shift
+done
+
+command -v "$docker" >/dev/null 2>&1 || die "'$docker' isn't installed (set DOCKER to use another command)"
+
+tab=$(printf '\t')
+set -- ps --format "{{.Names}}$tab{{.Image}}$tab{{.Status}}$tab{{.Ports}}"
+[ "$all" -eq 0 ] || set -- "$@" --all
+
+err=$(mktemp "${TMPDIR:-/tmp}/dps.XXXXXX")
+trap 'rm -f "$err"' EXIT
+rows=$("$docker" "$@" 2>"$err") || die "$(tail -n 1 "$err")"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  green=$'\033[32m' red=$'\033[31m' yellow=$'\033[33m' dim=$'\033[2m' reset=$'\033[0m'
+else
+  green='' red='' yellow='' dim='' reset=''
+fi
+
+printf '%s\n' "$rows" | awk -F'\t' -v want="$filter" -v all="$all" \
+  -v green="$green" -v red="$red" -v yellow="$yellow" -v dim="$dim" -v reset="$reset" '
+  # Shorten a long value from the left, keeping the end (the tag matters).
+  function fit(s, w) { return (length(s) <= w) ? s : "..." substr(s, length(s) - w + 4) }
+  # "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 9000/tcp" -> "8080->80, 9000/tcp"
+  function tidy(p,   n, parts, i, e, seen, out) {
+    n = split(p, parts, ", ")
+    out = ""
+    for (i = 1; i <= n; i++) {
+      e = parts[i]
+      sub(/^0\.0\.0\.0:/, "", e)
+      sub(/^\[::\]:/, "", e)
+      sub(/^:::/, "", e)
+      if (e ~ /->/) sub(/\/tcp$/, "", e)   # published TCP is the usual case
+      if (e == "" || (e in seen)) continue    # the same port on IPv4 and IPv6
+      seen[e] = 1
+      out = (out == "") ? e : out ", " e
+    }
+    return out
+  }
+  function paint(status) {
+    if (status ~ /unhealthy|^Restarting|^Dead/) return red
+    if (status ~ /^Exited \(0\)/ || status ~ /^Created/) return dim
+    if (status ~ /^Exited/) return red
+    if (status ~ /^Paused|starting/) return yellow
+    if (status ~ /^Up/) return green
+    return ""
+  }
+  NF < 3 { next }
+  want != "" && index(tolower($1), tolower(want)) == 0 { next }
+  {
+    n++
+    name[n] = fit($1, 40); image[n] = fit($2, 40); status[n] = $3; ports[n] = tidy($4)
+    if (length(name[n]) > wn) wn = length(name[n])
+    if (length(image[n]) > wi) wi = length(image[n])
+    if (length(status[n]) > ws) ws = length(status[n])
+  }
+  END {
+    if (n == 0) {
+      what = all ? "containers" : "running containers"
+      # Like grep: no match for a NAME is a failure, an empty list is not.
+      if (want != "") { printf "No %s match \"%s\".\n", what, want > "/dev/stderr"; exit 1 }
+      printf "No %s.\n", what > "/dev/stderr"
+      exit 0
+    }
+    if (wn < 4) wn = 4; if (wi < 5) wi = 5; if (ws < 6) ws = 6
+    printf "%-" wn "s  %-" wi "s  %-" ws "s  %s\n", "NAME", "IMAGE", "STATUS", "PORTS"
+    for (i = 1; i <= n; i++) {
+      # Pad first, then colour, so escape codes do not upset the columns.
+      line = sprintf("%-" wn "s  %-" wi "s  %s%-" ws "s%s  %s", name[i], image[i], paint(status[i]), status[i], reset, ports[i])
+      sub(/ +$/, "", line)
+      print line
+    }
+  }'
