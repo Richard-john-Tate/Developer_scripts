@@ -81,7 +81,9 @@ last_error=''
 
 http_ok() {
   if have curl; then
-    last_error=$(curl -fsS -o /dev/null --max-time 5 "$1" 2>&1)
+    # --connect-timeout: a connection that hangs (macOS silently drops them
+    # while a server is still starting) is retried instead of eating 5s.
+    last_error=$(curl -fsS -o /dev/null --connect-timeout 2 --max-time 5 "$1" 2>&1)
   elif have wget; then
     last_error=$(wget -q -O /dev/null -T 5 "$1" 2>&1) && return 0
     last_error=${last_error:-wget: request failed}

@@ -360,9 +360,16 @@ test_wait_for_http_url() {
   mkdir site && echo ok >site/health
   (cd site && exec python3 -m http.server "$port" --bind 127.0.0.1 >../server.log 2>&1) &
   srv=$!
+  # Wait for the test server itself first: on macOS a connection made while
+  # it's still starting is dropped, not refused, which would eat the timeout.
+  wait-for -q -t 20 "127.0.0.1:$port" || { kill "$srv"; fail "the test web server didn't start"; }
   run wait-for -t 10 "http://127.0.0.1:$port/health"
+  status_ok=$status
+  run wait-for -t 2 "http://127.0.0.1:$port/missing"
   kill "$srv" 2>/dev/null
-  [ "$status" -eq 0 ] || fail "expected the URL to come up; server log: $(cat server.log)"
+  [ "$status_ok" -eq 0 ] || fail "the health URL wasn't seen as up"
+  expect_status 1
+  expect_out "404"
 }
 
 test_wait_for_explains_a_timeout() {
