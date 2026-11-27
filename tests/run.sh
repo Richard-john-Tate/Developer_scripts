@@ -36,6 +36,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # --- assertions -------------------------------------------------------------
 # run CMD...  sets $out (stdout and stderr together) and $status.
 run() { out=$("$@" 2>&1); status=$?; }
+out='' status=0   # so fail() works even before a test's first run
 fail() { printf '    FAIL: %s\n' "$*"; printf '    output was:\n%s\n' "$(printf '%s\n' "$out" | sed 's/^/      | /')"; exit 1; }
 skip() { printf '    (skipped: %s)\n' "$*"; exit 3; }
 expect_status() { [ "$status" -eq "$1" ] || fail "expected exit status $1, got $status"; }
@@ -356,13 +357,22 @@ test_wait_for_rejects_bad_target() {
 test_wait_for_http_url() {
   have curl || have wget || skip "no curl or wget"
   have python3 || skip "python3 not installed"
-  port=$(free_port)
   mkdir site && echo ok >site/health
-  (cd site && exec python3 -m http.server "$port" --bind 127.0.0.1 >../server.log 2>&1) &
+  # The test server binds port 0, so the OS picks a port that's really free,
+  # and prints it once it's listening (a port from free_port proved
+  # unreachable on GitHub's macOS runners).
+  (cd site && exec python3 -c '
+import http.server, sys
+class Quiet(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args): pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+print(server.server_address[1], flush=True)
+server.serve_forever()' >../port.txt 2>../server.log) &
   srv=$!
-  # Wait for the test server itself first: on macOS a connection made while
-  # it's still starting is dropped, not refused, which would eat the timeout.
-  wait-for -q -t 20 "127.0.0.1:$port" || { kill "$srv"; fail "the test web server didn't start"; }
+  i=0
+  while [ ! -s port.txt ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  port=$(cat port.txt)
+  [ -n "$port" ] || { kill "$srv"; fail "the test web server didn't start: $(cat server.log)"; }
   run wait-for -t 10 "http://127.0.0.1:$port/health"
   status_ok=$status
   run wait-for -t 2 "http://127.0.0.1:$port/missing"
