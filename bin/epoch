@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""epoch: convert between Unix timestamps and dates."""
+
+import argparse
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+
+PROG = os.path.basename(sys.argv[0])
+
+HELP = f"""\
+Usage: {PROG} [options] [VALUE...]
+
+Convert between Unix timestamps and human dates.
+
+  {PROG}                       the time now, as a timestamp and as dates
+  {PROG} 1764201600            a timestamp -> dates. Milliseconds,
+                              microseconds and nanoseconds are recognised
+                              from the number of digits
+  {PROG} 2026-11-27            a date -> timestamp
+  {PROG} "2026-11-27 14:30"    dates are ISO 8601: a T or a space before
+  {PROG} 2026-11-27T14:30:00Z  the time, and Z or +02:00 for a time zone
+
+A date without a time zone is read as your local time. Add Z for UTC, or
+use --utc.
+
+Options:
+  -u, --utc    read dates without a time zone as UTC
+  -q, --quiet  print only the result: an ISO date for a timestamp,
+               seconds for a date (handy in scripts)
+  -h, --help   show this help"""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f'{PROG}: {message}\nTry "{PROG} --help".\n')
+        sys.exit(2)
+
+
+TIMESTAMP = re.compile(r"^-?\d+(\.\d+)?$")
+UNITS = [(18, 1e9, "nanoseconds"), (15, 1e6, "microseconds"), (12, 1e3, "milliseconds"), (0, 1, "seconds")]
+
+
+def ago(seconds):
+    """'3 days ago' / 'in 2 hours' for a difference from now in seconds."""
+    future = seconds > 0
+    s = abs(seconds)
+    for size, unit in ((31557600, "year"), (2629800, "month"), (86400, "day"),
+                       (3600, "hour"), (60, "minute"), (1, "second")):
+        if s >= size or size == 1:
+            n = int(s // size)
+            if n == 0:
+                return "right now"
+            text = f"{n} {unit}{'' if n == 1 else 's'}"
+            return f"in {text}" if future else f"{text} ago"
+
+
+def show(moment, quiet):
+    utc = moment.astimezone(timezone.utc)
+    local = moment.astimezone()
+    if quiet:
+        print(utc.strftime("%Y-%m-%dT%H:%M:%S") + (f".{utc.microsecond:06d}".rstrip("0") if utc.microsecond else "") + "Z")
+        return
+    print(f"  UTC:     {utc.strftime('%Y-%m-%d %H:%M:%S %a')}")
+    zone = local.strftime("%Z")
+    zone = "UTC" if zone == "UTC" else f"{zone}, UTC{local.strftime('%z')}"
+    print(f"  Local:   {local.strftime('%Y-%m-%d %H:%M:%S %a')} ({zone})")
+    print(f"  ISO:     {utc.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    print(f"  Which is {ago(moment.timestamp() - time.time())}")
+
+
+def from_timestamp(text, quiet):
+    digits = len(text.lstrip("-").split(".")[0])
+    for min_digits, divisor, unit in UNITS:
+        if digits >= min_digits:
+            break
+    seconds = float(text) / divisor
+    try:
+        moment = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError(f"{text} is out of range for a date") from None
+    if not quiet:
+        print(f"{text} ({unit})")
+    show(moment, quiet)
+
+
+def parse_date(text, assume_utc):
+    s = text.strip()
+    s = re.sub(r"[Zz]$", "+00:00", s)                     # Python < 3.11 can't read Z
+    s = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", s)        # +0200 -> +02:00
+    s = re.sub(r"^(\d{4}-\d\d-\d\d)[Tt ]", r"\1T", s)
+    try:
+        moment = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(f"can't read '{text}' as a date; use ISO 8601, e.g. 2026-11-27 or "
+                         "2026-11-27T14:30:00Z") from None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc) if assume_utc else moment.astimezone()
+    return moment
+
+
+def from_date(text, assume_utc, quiet):
+    moment = parse_date(text, assume_utc)
+    seconds = moment.timestamp()
+    whole = int(seconds) if seconds == int(seconds) else seconds
+    if quiet:
+        print(whole)
+        return
+    print(f"{text} ({moment.strftime('UTC%z')})")
+    print(f"  Seconds:       {whole}")
+    print(f"  Milliseconds:  {round(seconds * 1000)}")
+    print(f"  UTC:           {moment.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %a')}")
+    print(f"  Which is       {ago(seconds - time.time())}")
+
+
+def main():
+    parser = Parser(prog=PROG, add_help=False, allow_abbrev=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-u", "--utc", action="store_true")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("values", nargs="*")
+    args = parser.parse_args()
+    if args.help:
+        print(HELP)
+        return 0
+
+    if not args.values:
+        now = time.time()
+        if args.quiet:
+            print(int(now))
+            return 0
+        print(f"Now: {int(now)} (seconds), {int(now * 1000)} (milliseconds)")
+        show(datetime.fromtimestamp(now, tz=timezone.utc), quiet=False)
+        return 0
+
+    status = 0
+    for i, value in enumerate(args.values):
+        if i and not args.quiet:
+            print()
+        try:
+            if TIMESTAMP.match(value):
+                from_timestamp(value, args.quiet)
+            else:
+                from_date(value, args.utc, args.quiet)
+        except ValueError as err:
+            sys.stderr.write(f"{PROG}: {err}\n")
+            status = 1
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # The reader went away (e.g. piped into head): stop quietly.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

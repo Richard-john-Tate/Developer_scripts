@@ -5,14 +5,17 @@ development chores: tidying git branches, freeing a stuck port, waiting for
 a database to come up, unpacking an archive, finding what's eating your
 disk.
 
-Each script is a single self-contained bash file. Copy one into any folder
-on your `PATH` and it works on its own. All of them:
+Each script is a single self-contained file: bash for most of them, and
+Python 3 for the data tools, which need real JSON, CSV and date parsing.
+Copy one into any folder on your `PATH` and it works on its own. All of
+them:
 
 - print a short manual with `--help`;
 - ask before deleting anything, and have a `--dry-run` where it matters;
 - exit with `0` on success, `1` on failure, `2` on a usage mistake;
 - turn off colour when the output isn't a terminal or `NO_COLOR` is set;
-- run on Linux and macOS (bash 3.2 or later, standard system tools).
+- run on Linux and macOS (bash 3.2 or later, Python 3.8 or later, and
+  standard system tools).
 
 ## The scripts
 
@@ -74,6 +77,17 @@ leaves a half-written file behind.
 | [`ffthumbs`](bin/ffthumbs) | A thumbnail, N evenly spaced frames, or a contact sheet (`-s 4x4`) of a whole video. |
 | [`ffconcat`](bin/ffconcat) | Join clips end to end, losslessly when they match, or with `-r` for any mix of sizes and formats. |
 
+### Data and text
+
+| Command | What it does |
+| --- | --- |
+| [`jsonfmt`](bin/jsonfmt) | Pretty-print, minify (`-c`), sort (`-s`) or check (`--check`) JSON. Shows exactly where broken JSON breaks. Never rounds big numbers. `-w` reformats files in place. |
+| [`jwt-decode`](bin/jwt-decode) | Show a JWT's header and claims, when it was issued and expires, and whether it has expired. Decodes only; doesn't check the signature. |
+| [`epoch`](bin/epoch) | Convert Unix timestamps (seconds, ms, µs or ns) to dates and ISO dates back to timestamps, in UTC and local time. |
+| [`urlencode`](bin/urlencode) | Percent-encode text for a URL. `-f` for form style (`+` for spaces). |
+| [`urldecode`](bin/urldecode) | Decode `%XX` codes. `-p` takes a whole URL apart into host, path and decoded query parameters. |
+| [`csvview`](bin/csvview) | Show a CSV or TSV file as an aligned table. Handles quoted commas and line breaks, and detects the delimiter. |
+
 ## Install
 
 ```sh
@@ -132,6 +146,15 @@ ffaudio -t mp3 lecture.mp4
 ffthumbs -s 4x4 lecture.mp4      # contact sheet of the whole video
 ffconcat part1.mp4 part2.mp4 part3.mp4
 
+# Data and text
+curl -s https://api.github.com/repos/git/git | jsonfmt
+jsonfmt --check config/*.json    # exit status 1 if any is broken
+pbpaste | jwt-decode             # what's in this token? has it expired?
+epoch 1764201600                 # -> 2025-11-27 00:00:00 UTC
+epoch 2026-11-27T09:00:00Z       # -> 1795770000
+urldecode -p "$LONG_TRACKING_LINK"
+csvview -n 20 export.csv
+
 # Projects
 todos -c
 loc
@@ -144,8 +167,11 @@ Run any command with `--help` for all its options.
 
 ## Requirements
 
-Only bash and the tools that ship with Linux and macOS. A few features use
-an extra tool if it's there:
+Bash and the tools that ship with Linux and macOS, plus Python 3 for the
+data tools (`jsonfmt`, `jwt-decode`, `epoch`, `urlencode`, `urldecode`,
+`csvview`). Python 3 comes with most Linux systems, and with the Xcode
+command line tools on macOS. Some scripts need an extra tool, or use one
+if it's there:
 
 | Script | Uses |
 | --- | --- |

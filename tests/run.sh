@@ -1088,6 +1088,145 @@ test_ffconcat_lossless_mismatch_and_reencode() {
   no_partials
 }
 
+# --- data and text (Python) --------------------------------------------------
+
+need_python() { have python3 || skip "python3 not installed"; }
+
+test_jsonfmt_formats_and_keeps_numbers_exact() {
+  need_python
+  run sh -c 'echo "{\"id\": 12345678901234567890, \"price\": 1.10, \"b\": [1, {}], \"a\": \"café\"}" | jsonfmt -s'
+  expect_status 0
+  expect_out '"id": 12345678901234567890'
+  expect_out '"price": 1.10'
+  expect_out '"a": "café"'
+  first_key=$(printf '%s\n' "$out" | sed -n 2p)
+  [ "$first_key" = '  "a": "café",' ] || fail "--sort-keys didn't sort: $first_key"
+  run sh -c 'echo "{\"b\": 1, \"a\": [1, 2]}" | jsonfmt -c'
+  [ "$out" = '{"b":1,"a":[1,2]}' ] || fail "compact output wrong: $out"
+}
+
+test_jsonfmt_reports_errors_with_position() {
+  need_python
+  printf '{\n  "a": 1,\n  "b": [1, 2,,]\n}\n' >bad.json
+  run jsonfmt bad.json
+  expect_status 1
+  expect_out "bad.json: line 3, column 14"
+  run jsonfmt --check bad.json
+  expect_status 1
+  echo 'NaN' >nan.json
+  run jsonfmt --check nan.json
+  expect_status 1
+  echo '[1]' >good.json
+  run jsonfmt --check good.json
+  expect_status 0
+  [ -z "$out" ] || fail "--check printed something for valid JSON"
+}
+
+test_jsonfmt_write_in_place() {
+  need_python
+  printf '{"z":1,"y":[true,null]}' >data.json
+  chmod 640 data.json
+  run jsonfmt -w -s data.json
+  expect_status 0
+  expect_out "reformatted data.json"
+  [ "$(head -n 2 data.json | tail -n 1)" = '  "y": [' ] || fail "file not reformatted"
+  case $(ls -l data.json) in -rw-r-----*) ;; *) fail "permissions changed: $(ls -l data.json)" ;; esac
+  run jsonfmt -w -s data.json
+  expect_no_out reformatted
+  echo '{broken' >broken.json
+  run jsonfmt -w broken.json
+  expect_status 1
+  [ "$(cat broken.json)" = '{broken' ] || fail "a broken file was rewritten"
+  run jsonfmt -w
+  expect_status 2
+}
+
+test_epoch_both_directions() {
+  need_python
+  run env TZ=UTC epoch -q 1764201600
+  [ "$out" = 2025-11-27T00:00:00Z ] || fail "timestamp -> date wrong: $out"
+  run env TZ=UTC epoch -q 1764201600000
+  [ "$out" = 2025-11-27T00:00:00Z ] || fail "milliseconds not detected: $out"
+  run env TZ=UTC epoch -q 2025-11-27T00:00:00Z
+  [ "$out" = 1764201600 ] || fail "date -> timestamp wrong: $out"
+  run env TZ=Europe/Paris epoch -q "2025-11-27 01:00"
+  [ "$out" = 1764201600 ] || fail "local time zone not applied: $out"
+  run env TZ=Europe/Paris epoch -q -u "2025-11-27 00:00"
+  [ "$out" = 1764201600 ] || fail "--utc not applied: $out"
+  run env TZ=UTC epoch -q 2025-11-27T02:00:00+0200
+  [ "$out" = 1764201600 ] || fail "+0200 offset not applied: $out"
+  run env TZ=Europe/Paris epoch 1764201600
+  expect_out "CET"
+  run epoch tomorrow
+  expect_status 1
+  expect_out "ISO 8601"
+}
+
+# Builds an unsigned test JWT from a JSON payload.
+make_jwt() {
+  python3 -c '
+import base64, json, sys
+b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+print(b({"alg": "HS256", "typ": "JWT"}) + "." + b(json.loads(sys.argv[1])) + ".c2ln")' "$1"
+}
+
+test_jwt_decode_shows_claims_and_expiry() {
+  need_python
+  old=$(make_jwt '{"sub":"42","name":"José","exp":1700000000}')
+  run jwt-decode "$old"
+  expect_status 0
+  expect_out '"name": "José"'
+  expect_out "EXPIRED"
+  expect_out "Signature: not checked"
+  run jwt-decode -e "$old"
+  expect_status 1
+  fresh=$(make_jwt '{"sub":"42","exp":9999999999}')
+  run sh -c "echo 'Authorization: Bearer $fresh' | jwt-decode -e -p"
+  expect_status 0
+  expect_out '"exp": 9999999999'
+  expect_no_out Header
+  run jwt-decode not.a-token
+  expect_status 1
+  expect_out "3 parts"
+}
+
+test_urlencode_and_urldecode_round_trip() {
+  need_python
+  run urlencode "café & crème/?#"
+  [ "$out" = 'caf%C3%A9%20%26%20cr%C3%A8me%2F%3F%23' ] || fail "urlencode wrong: $out"
+  run urldecode "$out"
+  [ "$out" = 'café & crème/?#' ] || fail "round trip failed: $out"
+  run urlencode -f "big cats"
+  [ "$out" = 'big+cats' ] || fail "--form wrong: $out"
+  run urlencode -p "dir name/file.txt"
+  [ "$out" = 'dir%20name/file.txt' ] || fail "--path wrong: $out"
+  run sh -c 'printf "one two\nthree\n" | urlencode'
+  [ "$out" = "$(printf 'one%%20two\nthree')" ] || fail "stdin lines wrong: $out"
+  run urldecode -p 'https://example.com:8443/a%20b?q=big+cats&next=https%3A%2F%2Fx.com%2F#top'
+  expect_out "host:      example.com"
+  expect_out "port:      8443"
+  expect_out "path:      /a b"
+  expect_out "q    = big cats"
+  expect_out "next = https://x.com/"
+}
+
+test_csvview_aligns_tricky_csv() {
+  need_python
+  printf 'name,qty,notes\nAlice,30,"has ""quotes"", and commas"\nBob,4,"two\nlines"\n' >t.csv
+  run csvview t.csv
+  expect_status 0
+  expect_out 'name  | qty | notes'
+  expect_out 'Alice |  30 | has "quotes", and commas'
+  expect_out 'Bob   |   4 | two\nlines'
+  printf 'a;b\n1;2\n' | csvview >semi.txt
+  grep -q '^a | b$' semi.txt || fail "semicolon delimiter not detected"
+  run csvview -n 1 -w 8 t.csv
+  expect_out 'has "...'
+  expect_no_out Bob
+  run csvview missing.csv
+  expect_status 1
+}
+
 # --- runner -----------------------------------------------------------------
 
 filter=${1:-}
